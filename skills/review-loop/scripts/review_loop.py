@@ -22,8 +22,10 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -40,6 +42,19 @@ SCHEMA_PATH = SKILL_DIR / "schemas" / "review.json"
 
 SEVERITIES = ["blocker", "high", "medium", "low", "nit"]
 STATE_DIRNAME = ".review-loop"
+
+
+def installed_version() -> str:
+    """Read the installed skill version without maintaining a third copy."""
+    try:
+        text = (SKILL_DIR / "SKILL.md").read_text()
+    except OSError:
+        return "unknown"
+    frontmatter_end = text.find("\n---\n", 4)
+    if frontmatter_end == -1:
+        return "unknown"
+    match = re.search(r"(?m)^version:\s*([^\s]+)\s*$", text[:frontmatter_end])
+    return match.group(1) if match else "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +104,12 @@ def _copilot_argv(prompt: str, model: str, effort: str, readonly: bool,
     if effort:
         argv += ["--effort", effort]
     if readonly:
-        argv += ["--deny-tool", "write", "--deny-tool", "shell(git commit)",
-                 "--deny-tool", "shell(git push)"]
+        # `write` deliberately does not cover the shell tool — Copilot's own
+        # permissions help says so — and denials override --allow-all-tools.
+        # Denying specific commands is therefore useless: `sed -i`, `rm` and a
+        # shell redirection all still mutate the tree. Deny the shell outright
+        # and leave the reviewer its read-only file tools.
+        argv += ["--deny-tool", "write", "--deny-tool", "shell"]
     return argv, None
 
 
@@ -354,14 +373,20 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         # ids stay distinct — and so they can corroborate each other.
         seen[persona] = seen.get(persona, 0) + 1
         rv["slot_id"] = persona if seen[persona] == 1 else f"{persona}-{seen[persona]}"
-        # Prefer the persona's own name ("Adversarial QA") over title-casing
-        # the slug, which mangles acronyms into "Adversarial Qa".
-        if not rv.get("label"):
+        # Derived fields are rebuilt from `label_base`, never from the last
+        # result. `start` validates a config and then the detached `run`
+        # validates the file it wrote, so anything appended in place would be
+        # appended twice — "Security Engineer #2 #2".
+        if not rv.get("label_base"):
+            # Prefer the persona's own name ("Adversarial QA") over title-casing
+            # the slug, which mangles acronyms into "Adversarial Qa".
             meta = _persona_meta(PERSONA_DIR / f"{persona}.md") \
                 if (PERSONA_DIR / f"{persona}.md").exists() else {}
-            rv["label"] = meta.get("name") or persona.replace("-", " ").title()
-        if seen[persona] > 1:
-            rv["label"] = f"{rv['label']} #{seen[persona]}"
+            rv["label_base"] = (rv.get("label")
+                                or meta.get("name")
+                                or persona.replace("-", " ").title())
+        rv["label"] = rv["label_base"] if seen[persona] == 1 \
+            else f"{rv['label_base']} #{seen[persona]}"
 
     for slot in ([impl] if isinstance(impl, dict) else []) + \
                 [r for r in reviewers if isinstance(r, dict)]:
@@ -373,6 +398,39 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         if ad and effort and effort not in ad["efforts"]:
             errors.append(f"effort {effort!r} is not supported by {cli}; "
                           f"choose from {ad['efforts']}.")
+
+    # The independent gate is the reason this tool is worth running. Validate
+    # its shape before treating it as present: a string would otherwise be run
+    # one character at a time, while an empty string is a successful shell
+    # no-op and could make "nothing ran" read as "validation passed".
+    validation = config.get("validation")
+    if validation is None:
+        validation = {}
+    commands: list[Any] = []
+    validation_shape_ok = True
+    if not isinstance(validation, dict):
+        errors.append("`validation` must be an object with a `commands` list.")
+        validation_shape_ok = False
+    else:
+        raw_commands = validation.get("commands", [])
+        if not isinstance(raw_commands, list):
+            errors.append("`validation.commands` must be a list of shell command strings.")
+            validation_shape_ok = False
+        else:
+            commands = raw_commands
+            bad_commands = [i for i, cmd in enumerate(commands)
+                            if not isinstance(cmd, str) or not cmd.strip()]
+            if bad_commands:
+                errors.append("`validation.commands` contains empty or non-string entries "
+                              f"at indexes {bad_commands}.")
+                validation_shape_ok = False
+
+    if validation_shape_ok and not commands \
+            and not config.get("allow_missing_validation"):
+        errors.append("`validation.commands` is empty: there would be no independent "
+                      "gate, and the loop could only approve on model consensus. "
+                      "Add commands, or set `allow_missing_validation: true` to "
+                      "accept a run whose outcome is unverified.")
 
     bad = set(config.get("blocking_severities") or []) - set(SEVERITIES)
     if bad:
@@ -634,6 +692,45 @@ def extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _verdict(obj: dict[str, Any]) -> str:
+    """The reviewer's own verdict, normalised.
+
+    Returns "" when the reviewer did not state one. Anything stated but
+    unrecognised counts as `changes_requested`: approval has to be explicit.
+    """
+    raw = obj.get("verdict")
+    if raw is None or not str(raw).strip():
+        return ""
+    return "approved" if str(raw).strip().lower() == "approved" else "changes_requested"
+
+
+def review_problem(obj: dict[str, Any] | None) -> str | None:
+    """Why this review object cannot be trusted, or None if it is well formed.
+
+    `extract_json` only asks whether *something* JSON-shaped came back, and
+    only Codex can be schema-constrained, so the shape has to be checked here
+    for every adapter. Anything that fails this is a reviewer that did not
+    report — never a reviewer that approved. The permissive readings are the
+    dangerous ones: a missing verdict and a `findings` value that is not a list
+    both normalise to zero findings, which reads exactly like a clean review.
+    """
+    if not isinstance(obj, dict):
+        return "review was not a JSON object"
+    if "verdict" not in obj:
+        return "no verdict field"
+    verdict = _verdict(obj)
+    if not verdict:
+        return "empty verdict field"
+    findings = obj.get("findings")
+    if not isinstance(findings, list):
+        return f"`findings` was {type(findings).__name__}, not a list"
+    if any(not isinstance(f, dict) for f in findings):
+        return "`findings` contained entries that were not objects"
+    if verdict == "changes_requested" and not findings:
+        return "requested changes but listed no findings"
+    return None
+
+
 def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None,
                        max_findings: int = 10) -> list[dict[str, Any]]:
     """Parse and bound one reviewer's output.
@@ -644,8 +741,9 @@ def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None,
     """
     if not obj:
         return []
+    raw = obj.get("findings")
     out = []
-    for i, f in enumerate(obj.get("findings") or []):
+    for i, f in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(f, dict):
             continue
         sev = str(f.get("severity", "medium")).strip().lower()
@@ -708,6 +806,90 @@ def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+def _same_defect(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether two findings, possibly from different rounds, describe one defect.
+
+    Same rule as `dedupe`, applied across time instead of across reviewers:
+    reviewers reword a finding between rounds, so an exact-string key would
+    report every survivor as a brand new defect.
+    """
+    if not a.get("file") or a.get("file") != b.get("file"):
+        return False
+    if isinstance(a.get("line"), int) and isinstance(b.get("line"), int) \
+            and abs(a["line"] - b["line"]) > 15:
+        return False
+
+    def tokens(f: dict[str, Any]) -> set[str]:
+        text = (str(f.get("problem", "")) + " " + str(f.get("category", ""))).lower()
+        return set(re.findall(r"[a-z_]{4,}", text))
+
+    x, y = tokens(a), tokens(b)
+    return len(x & y) / max(1, min(len(x), len(y))) >= 0.5
+
+
+class Ledger:
+    """Every finding the panel has raised, and what became of it.
+
+    The loop re-reviews from scratch each round, so the last round's merged
+    list is a snapshot, not a history: it cannot say what was raised and
+    fixed, and a low-severity finding that a later panel did not repeat would
+    simply vanish from the report. This keeps them all, with a state.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+
+    def record_round(self, iteration: int, findings: list[dict[str, Any]],
+                     panel_complete: bool = True) -> None:
+        matched: list[dict[str, Any]] = []
+        for f in findings:
+            hit = next((e for e in self.entries if _same_defect(e, f)), None)
+            if hit is None:
+                entry = dict(f)
+                entry.update({"state": "open", "first_seen": iteration,
+                              "last_seen": iteration, "rounds_seen": [iteration]})
+                self.entries.append(entry)
+                matched.append(entry)
+                continue
+            # A defect that came back after a round without it is worth calling
+            # out separately: the fix for it did not hold.
+            if hit["state"] == "resolved":
+                hit["state"] = "reappeared"
+                hit.pop("resolved_in", None)
+            else:
+                hit["state"] = "open"
+            # Keep the most severe wording the panel has used for it.
+            if SEVERITIES.index(f["severity"]) < SEVERITIES.index(hit["severity"]):
+                hit.update({k: f[k] for k in
+                            ("severity", "problem", "impact", "recommended_fix")})
+            hit["last_seen"] = iteration
+            hit["rounds_seen"].append(iteration)
+            for who in [f["reviewer"]] + list(f.get("corroborated_by") or []):
+                if who != hit["reviewer"] and who not in hit.setdefault("corroborated_by", []):
+                    hit["corroborated_by"].append(who)
+            matched.append(hit)
+
+        # A finding that this round did not repeat is only evidence of a fix if
+        # the whole panel actually reported. If a reviewer dropped out, silence
+        # about its findings means nothing.
+        if not panel_complete:
+            return
+        seen = {id(e) for e in matched}
+        for e in self.entries:
+            if id(e) not in seen and e["state"] in ("open", "reappeared"):
+                e["state"] = "resolved"
+                e["resolved_in"] = iteration
+
+    def open_findings(self) -> list[dict[str, Any]]:
+        return [e for e in self.entries if e["state"] in ("open", "reappeared")]
+
+    def resolved(self) -> list[dict[str, Any]]:
+        return [e for e in self.entries if e["state"] == "resolved"]
+
+    def to_json(self) -> list[dict[str, Any]]:
+        return self.entries
+
+
 # ---------------------------------------------------------------------------
 # Git + validation
 # ---------------------------------------------------------------------------
@@ -715,6 +897,259 @@ def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def git(repo: Path, *args: str) -> str:
     r = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
     return r.stdout.strip()
+
+
+def _porcelain_entries(raw: str) -> list[tuple[str, str]]:
+    """Parse `git status --porcelain -z` into (status, path) pairs.
+
+    `-z` because the default format C-quotes any path with a space or a
+    non-ASCII byte, which slicing would then mangle. Rename and copy entries
+    carry a second, trailing field holding the source path; it has to be
+    consumed or it reads as an entry of its own with a garbled status.
+    """
+    fields = raw.split("\0")
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        status, path = rec[:2], rec[3:]
+        if "R" in status or "C" in status:
+            i += 1   # skip the source path that follows
+        out.append((status, path))
+    return out
+
+
+def _is_state_path(path: str) -> bool:
+    """Whether a repository path is the orchestrator's own state directory.
+
+    Exact match or a directory prefix — a `startswith` on the bare name also
+    swallows sibling files like `.review-loop-config`, which are the user's.
+    """
+    p = path.rstrip("/")
+    return p == STATE_DIRNAME or p.startswith(STATE_DIRNAME + "/")
+
+
+def preflight_repo(repo: Path, config: dict[str, Any]) -> list[str]:
+    """Refuse to run somewhere the loop could do damage it cannot undo.
+
+    The skill asks its host to check this, but the script is a CLI and is
+    routinely driven directly, so the guarantee has to live here. Both gates
+    are overridable — deliberately, and only in the config.
+    """
+    problems: list[str] = []
+    if not repo.is_dir():
+        return [f"repo path does not exist: {repo}"]
+
+    inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                            cwd=str(repo), capture_output=True, text=True)
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        if not config.get("allow_non_git"):
+            problems.append(f"{repo} is not a git working tree. The build agent edits "
+                            "files in place and there would be no way to see or undo "
+                            "what it changed. Set `allow_non_git: true` to override.")
+        return problems
+
+    # --porcelain omits ignored files, so `.review-loop/` normally never trips
+    # this — but an older run, or a user who deleted its .gitignore, still can,
+    # and orchestration state is not the user's work.
+    raw = subprocess.run(["git", "status", "--porcelain", "-z"],
+                         cwd=str(repo), capture_output=True, text=True).stdout
+    dirty = [path for _, path in _porcelain_entries(raw) if not _is_state_path(path)]
+    if dirty and not config.get("allow_dirty"):
+        names = dirty[:10]
+        more = f" (+{len(dirty) - 10} more)" if len(dirty) > 10 else ""
+        problems.append("the working tree is dirty, so uncommitted work would be mixed "
+                        "into the diff under review and may be modified by the build "
+                        f"agent: {', '.join(names)}{more}. Commit or stash first, or set "
+                        "`allow_dirty: true`.")
+    return problems
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, owned by someone else
+    except Exception:
+        return False
+    return True
+
+
+def new_lock_token() -> str:
+    return secrets.token_hex(16)
+
+
+def acquire_lock(state: Path, token: str, pid: int,
+                 run_dir: Path | None = None,
+                 adopt_only: bool = False) -> str | None:
+    """Claim the one-run-per-worktree lock. Returns an error string, or None.
+
+    Two concurrent runs would edit the same files, review each other's
+    half-finished changes and race on `current-run`. The create is atomic, so
+    the loser finds out rather than silently proceeding.
+
+    `token` is how a run proves the lock is its own. `start` mints one, takes
+    the lock, and passes the token to the detached `run` it spawns, which
+    presents it to adopt the lock under its own pid. It must be an unguessable
+    secret rather than something derivable — two `start` calls racing pick the
+    same next run number, so identifying a run by its directory would let each
+    mistake the other for its own child. Adoption rotates the token, so a
+    handoff can only be used once. A detached child uses `adopt_only`: if the
+    parent-held lock is gone, it must fail rather than recreate the lock and
+    replay an old resolved config over an existing run directory.
+    """
+    lock = state / "lock"
+
+    def payload(tok: str) -> str:
+        return json.dumps({"pid": pid, "token": tok,
+                           "run_dir": str(run_dir) if run_dir else None,
+                           "started": datetime.now(timezone.utc).isoformat()})
+
+    for _ in range(100):
+        if not adopt_only:
+            # Write the content first and link it into place: creating the lock
+            # empty and filling it a moment later leaves a window where a racing
+            # caller reads nothing, concludes the lock is corrupt, and steals it.
+            # `os.link` fails if the target exists, so the file is never partial.
+            tmp = state / f"lock.{os.getpid()}.{secrets.token_hex(4)}"
+            try:
+                tmp.write_text(payload(token))
+                try:
+                    os.link(str(tmp), str(lock))
+                    return None
+                except FileExistsError:
+                    pass
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+
+        try:
+            held = json.loads(lock.read_text())
+            if not isinstance(held, dict):
+                raise ValueError
+        except FileNotFoundError:
+            if adopt_only:
+                return ("could not adopt the review-loop lock: the parent-held lock "
+                        "is missing or has already been consumed. Start a new run "
+                        "instead of replaying a resolved config.")
+            continue
+        except Exception:
+            # Unreadable. Give whoever wrote it time to be recognisable rather
+            # than assuming the worktree is free.
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except FileNotFoundError:
+                if adopt_only:
+                    return ("could not adopt the review-loop lock: the parent-held lock "
+                            "is missing or has already been consumed. Start a new run "
+                            "instead of replaying a resolved config.")
+                continue
+            if age < 60:
+                return ("another review-loop run is holding this worktree "
+                        "(its lock file is unreadable). Retry, or remove "
+                        f"{lock} if you are certain nothing is running.")
+            held = {}
+
+        if held.get("token") and held.get("token") == token:
+            # Our own handoff. Rotate the token so it cannot be replayed.
+            lock.write_text(payload(new_lock_token()))
+            return None
+        other_pid = held.get("pid")
+        if isinstance(other_pid, int) and other_pid > 0 and _pid_alive(other_pid):
+            return (f"another review-loop run is already active in this worktree "
+                    f"(pid {other_pid}, {held.get('run_dir') or 'starting up'}). "
+                    f"Stop it first: review_loop.py stop --kill")
+        # Stale lock from a crashed or killed run. A fresh caller may reclaim
+        # it, but a detached child must only ever consume its exact handoff.
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
+        if adopt_only:
+            return ("could not adopt the review-loop lock: its handoff token no longer "
+                    "matches. Start a new run instead of replaying a resolved config.")
+    return "could not acquire the review-loop lock; retry"
+
+
+def handoff_lock(state: Path, token: str, pid: int, run_dir: Path) -> None:
+    """Point the lock at the detached child while the handoff is still pending.
+
+    Without this the lock briefly names a `start` process that has already
+    exited, which the next caller would read as stale. Matching on the token
+    makes it a no-op once the child has adopted the lock — or released it.
+    """
+    lock = state / "lock"
+    try:
+        held = json.loads(lock.read_text())
+    except Exception:
+        return
+    if held.get("token") == token:
+        held.update({"pid": pid, "run_dir": str(run_dir)})
+        lock.write_text(json.dumps(held))
+
+
+def release_lock(state: Path, run_dir: Path) -> None:
+    lock = state / "lock"
+    try:
+        held = json.loads(lock.read_text())
+    except Exception:
+        return
+    if held.get("run_dir") == str(run_dir):
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _state_for_run(run_dir: Path) -> Path | None:
+    """Resolve the state directory from a standard history/run-NN path."""
+    resolved = run_dir.resolve()
+    if resolved.parent.name != "history":
+        return None
+    state = resolved.parent.parent
+    return state if state.name == STATE_DIRNAME else None
+
+
+def _locked_run_pid(run_dir: Path) -> int | None:
+    """Return the pid only when the live lock names this exact run.
+
+    A run's pid file is historical evidence, not authority to signal forever:
+    after completion that pid may be reused by an unrelated process. The
+    worktree lock is the active-run record and must agree with both paths.
+    """
+    state = _state_for_run(run_dir)
+    if state is None:
+        return None
+    try:
+        held = json.loads((state / "lock").read_text())
+        pid = int(held.get("pid"))
+        locked_dir = Path(str(held.get("run_dir"))).resolve()
+        recorded_pid = int((run_dir / "pid").read_text().strip())
+    except Exception:
+        return None
+    if locked_dir != run_dir.resolve() or recorded_pid != pid or pid <= 0:
+        return None
+    return pid
+
+
+def _pid_is_review_loop(pid: int, run_dir: Path) -> bool:
+    """Guard against a stale lock whose pid has been reused by another process."""
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    command = result.stdout.strip()
+    return (result.returncode == 0
+            and str(Path(__file__).resolve()) in command
+            and str((run_dir / "config.json").resolve()) in command)
 
 
 def base_commit(repo: Path) -> str | None:
@@ -783,8 +1218,11 @@ def collect_diff(repo: Path, base_sha: str | None,
                  if f.strip() and not f.startswith(STATE_DIRNAME)]
 
     per_file = int(config.get("max_file_chars", 20000))
+    max_untracked = int(config.get("max_untracked_files", 60))
     manifest: dict[str, Any] = {"truncated_files": [], "skipped_files": [],
-                                "untracked_files": len(untracked)}
+                                "omitted_files": untracked[max_untracked:],
+                                "untracked_files": len(untracked),
+                                "untracked_included": min(len(untracked), max_untracked)}
 
     files = _split_by_file("".join(parts))
     kept: list[str] = []
@@ -796,10 +1234,25 @@ def collect_diff(repo: Path, base_sha: str | None,
         # whatever section follows it.
         kept.append(body if body.endswith("\n") else body + "\n")
 
-    for path in untracked[:60]:
+    for path in untracked[:max_untracked]:
         full = repo / path
         try:
-            size = full.stat().st_size
+            info = full.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                # Never follow an untracked symlink. Otherwise a repository can
+                # point at ~/.ssh, a credential file or anything else readable
+                # by the host and have its contents copied into every reviewer
+                # prompt and transcript.
+                target = os.readlink(full)
+                kept.append(f"--- new symlink: {path} -> {target} ---\n")
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                # FIFOs can block forever on read; devices and sockets have no
+                # meaningful text payload to inline. Name them without opening.
+                manifest["skipped_files"].append({"path": path, "chars": 0})
+                kept.append(f"--- new special file, not opened: {path} ---\n")
+                continue
+            size = info.st_size
             if size > per_file:
                 manifest["skipped_files"].append({"path": path, "chars": size})
                 kept.append(f"--- new file, too large to inline: {path} ({size} bytes) ---\n")
@@ -810,6 +1263,14 @@ def collect_diff(repo: Path, base_sha: str | None,
             kept.append(f"--- new binary file: {path} ---\n")
             continue
         kept.append(f"--- new file: {path} ---\n{body}\n")
+
+    # Anything past the cap must be named, not silently dropped: a reviewer that
+    # is not told about a new file cannot know to go and read it.
+    if manifest["omitted_files"]:
+        listing = "\n".join(f"  {p}" for p in manifest["omitted_files"][:200])
+        kept.append(f"--- {len(manifest['omitted_files'])} further new files were not "
+                    f"inlined (cap: {max_untracked}); read them from the repository ---\n"
+                    f"{listing}\n")
 
     diff = "".join(kept)
 
@@ -835,19 +1296,37 @@ def diff_note(manifest: dict[str, Any], config: dict[str, Any]) -> str:
         lines.append(f"NOTE: {item['path']} was truncated; inspect it directly if relevant.")
     for item in manifest.get("skipped_files", [])[:10]:
         lines.append(f"NOTE: {item['path']} was not inlined; read it from the repository.")
+    omitted = manifest.get("omitted_files") or []
+    if omitted:
+        lines.append(f"NOTE: {len(omitted)} new files exceeded the untracked-file cap and "
+                     f"were listed by path only. Read them from the repository before "
+                     f"concluding the change is complete.")
     if manifest.get("payload_truncated"):
         lines.append("NOTE: the diff exceeded the payload budget and was cut. "
                      "Use git to inspect anything missing.")
     return "\n".join(lines)
 
 
-def run_validation(run: Run) -> tuple[bool, list[dict[str, Any]]]:
+VALIDATION_PASSED = "passed"
+VALIDATION_FAILED = "failed"
+VALIDATION_NOT_CONFIGURED = "not_configured"
+
+
+def run_validation(run: Run, label: str = "") -> tuple[str, list[dict[str, Any]]]:
+    """Run the configured validation commands.
+
+    Returns a tri-state, not a boolean. "No commands configured" is not the
+    same fact as "the suite passed", and collapsing the two into True makes
+    the independent gate approve a run that was never checked.
+    """
     cmds = (run.config.get("validation") or {}).get("commands") or []
+    if not cmds:
+        return VALIDATION_NOT_CONFIGURED, []
     timeout = int(run.config.get("validation_timeout_seconds", 1800))
     results = []
     ok = True
     for cmd in cmds:
-        run.emit("validation_start", command=cmd)
+        run.emit("validation_start", command=cmd, stage=label or "round")
         try:
             r = subprocess.run(cmd, shell=True, cwd=str(run.repo),
                                capture_output=True, text=True, timeout=timeout)
@@ -861,8 +1340,8 @@ def run_validation(run: Run) -> tuple[bool, list[dict[str, Any]]]:
             tail = f"could not execute: {exc}"
         ok = ok and passed
         results.append({"command": cmd, "passed": passed, "output_tail": tail})
-        run.emit("validation_done", command=cmd, passed=passed)
-    return ok, results
+        run.emit("validation_done", command=cmd, passed=passed, stage=label or "round")
+    return (VALIDATION_PASSED if ok else VALIDATION_FAILED), results
 
 
 # ---------------------------------------------------------------------------
@@ -1027,20 +1506,50 @@ def load_persona(persona_id: str) -> str:
 def cmd_run(args: argparse.Namespace) -> int:
     config = json.loads(Path(args.config).read_text())
     problems = validate_config(config)
+    repo = Path(config.get("repo") or os.getcwd()).resolve()
+    problems += preflight_repo(repo, config)
     if problems:
         print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
               file=sys.stderr)
         return 1
-    repo = Path(config.get("repo") or os.getcwd()).resolve()
     state = repo / STATE_DIRNAME
-    state.mkdir(exist_ok=True)
+    _ensure_state_ignored(state)
 
-    run_dir = Path(config["run_dir"]) if config.get("run_dir") else _new_run_dir(state)
+    # A `run_dir` in the config means `start` already reserved one and is
+    # handing this process its lock; `lock_token` is the proof. Run directly
+    # and we mint our own token, which no live lock can match.
+    handed_over = bool(config.get("run_dir"))
+    token = config.get("lock_token") or new_lock_token()
+
+    held = acquire_lock(state, token, os.getpid(),
+                        Path(config["run_dir"]) if handed_over else None,
+                        adopt_only=handed_over)
+    if held:
+        print(json.dumps({"error": "run already active", "problems": [held]}, indent=2),
+              file=sys.stderr)
+        return 1
+
+    run_dir = Path(config["run_dir"]) if handed_over else _new_run_dir(state)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # The lock is keyed on the run directory from here on, so release can tell
+    # our lock from a later run's.
+    handoff_lock(state, token, os.getpid(), run_dir)
+    try:
+        return _run_loop(config, repo, state, run_dir)
+    finally:
+        release_lock(state, run_dir)
+
+
+def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) -> int:
     run = Run(repo, run_dir, config)
 
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
     (state / "task.md").write_text(config["task"])
+    # `start` writes this too, but a foreground `run` is a first-class entry
+    # point and `render`/`status` resolve through it — without this they would
+    # report on whichever run was started last.
+    (state / "current-run").write_text(str(run_dir))
+    (run_dir / "pid").write_text(str(os.getpid()))
 
     task = config["task"]
     blocking = set(config.get("blocking_severities") or ["blocker", "high", "medium"])
@@ -1053,6 +1562,26 @@ def cmd_run(args: argparse.Namespace) -> int:
              reviewers=[r["slot_id"] for r in config["reviewers"]],
              max_iterations=max_iter)
 
+    # --- baseline: was validation already failing before we touched it? ----
+    # Without this the loop cannot tell "the change broke the build" from "the
+    # build was broken when we arrived", and every later result is ambiguous.
+    baseline_status, baseline_results = run_validation(run, label="baseline")
+    (run_dir / "validation-00.json").write_text(json.dumps(
+        {"stage": "baseline", "status": baseline_status, "results": baseline_results}, indent=2))
+    run.emit("baseline_validation", status=baseline_status,
+             commands=len(baseline_results))
+    if baseline_status == VALIDATION_FAILED:
+        run.emit("warning", message="Validation was already failing before the task "
+                                    "started; the independent gate cannot attribute a "
+                                    "later failure to this change.")
+        if config.get("require_clean_baseline"):
+            final = _write_final(run, base_sha, "baseline_failed", Ledger(), 0,
+                                 VALIDATION_FAILED, blocking, baseline_status)
+            run.emit("run_complete", outcome="baseline_failed", rounds=0, findings=0,
+                     blocking_open=0, validation_status=VALIDATION_FAILED,
+                     final=str(final))
+            return exit_code("baseline_failed")
+
     # --- initial implementation -------------------------------------------
     cmds = (config.get("validation") or {}).get("commands") or []
     gate_note = ("This change will be judged by these commands, which are run "
@@ -1060,6 +1589,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                  + "\n".join(f"  {c}" for c in cmds)) if cmds else \
                 ("No validation commands are configured, so run whatever tests "
                  "this project already has.")
+    if baseline_status == VALIDATION_FAILED:
+        gate_note += ("\n\nThese commands were ALREADY FAILING before you started. "
+                      "Fix only what your task requires; say clearly in your summary "
+                      "which failures pre-existed.\n"
+                      + _validation_note(baseline_status, baseline_results))
 
     ok, text = invoke_agent(run, config["implementer"],
                             IMPLEMENTER_PROMPT.format(task=task, validation_note=gate_note),
@@ -1070,17 +1604,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         # progress stream must never be left waiting for an event that is not
         # coming.
         run.emit("run_failed", stage="implement", error=text)
-        final = _write_final(run, base_sha, "implementer_failed", [], 0, False, blocking)
+        final = _write_final(run, base_sha, "implementer_failed", Ledger(), 0,
+                             VALIDATION_NOT_CONFIGURED, blocking, baseline_status)
         run.emit("run_complete", outcome="implementer_failed", rounds=0, findings=0,
-                 blocking_open=0, validation_passed=False, final=str(final),
-                 error=text[:400])
-        return 1
+                 blocking_open=0, validation_status=VALIDATION_NOT_CONFIGURED,
+                 final=str(final), error=text[:400])
+        return exit_code("implementer_failed")
     (run_dir / "implementer-00.md").write_text(text)
 
     outcome = "max_iterations_reached"
-    all_findings: list[dict[str, Any]] = []
+    ledger = Ledger()
     rounds_run = 0
-    last_val_ok = False
+    val_status = VALIDATION_NOT_CONFIGURED
+    missing_reviewers: list[str] = []
     previous_diff = ""
     previous_signature: set[str] = set()
 
@@ -1093,8 +1629,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         run.emit("iteration_start", iteration=iteration)
 
         # --- independent gate: tests decide, not model consensus -----------
-        val_ok, val_results = run_validation(run)
-        last_val_ok = val_ok
+        val_status, val_results = run_validation(run)
+        val_ok = val_status == VALIDATION_PASSED
         (run_dir / f"validation-{iteration:02d}.json").write_text(json.dumps(val_results, indent=2))
 
         diff, manifest = collect_diff(repo, base_sha, config)
@@ -1120,8 +1656,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         previous_diff = diff
 
         # Reviewers get the verdict; the implementer gets the stack traces.
-        validation_note = _validation_note(val_ok, val_results, brief=True)
-        implementer_validation_note = _validation_note(val_ok, val_results)
+        validation_note = _validation_note(val_status, val_results, brief=True,
+                                           baseline=baseline_status)
+        implementer_validation_note = _validation_note(val_status, val_results,
+                                                       baseline=baseline_status)
 
         # --- reviewers, in parallel, read-only, no shared context ----------
         def do_review(rv: dict[str, Any]) -> tuple[dict[str, Any], bool, str]:
@@ -1143,46 +1681,78 @@ def cmd_run(args: argparse.Namespace) -> int:
             results = list(pool.map(do_review, reviewers))
 
         round_findings: list[dict[str, Any]] = []
+        missing_reviewers = []
         for rv, ok_, text_ in results:
             slot = rv["slot_id"]
             obj = extract_json(text_) if ok_ else None
-            if ok_ and obj is None:
-                # One repair attempt. This is a fresh session, so the required
+            problem = ("agent failed" if not ok_ else
+                       "unparseable output" if obj is None else review_problem(obj))
+            if ok_ and problem:
+                # One repair attempt, for a malformed shape as much as for
+                # unparseable text. This is a fresh session, so the required
                 # shape has to travel with the request.
                 ok2, text2 = invoke_agent(
                     run, rv,
                     REPAIR_PROMPT.format(shape=OUTPUT_SHAPE, previous=text_[:8000]),
                     readonly=True, label=f"{rv.get('label') or slot} (repair)",
                     log_name=f"iter{iteration:02d}-{slot}-repair")
-                obj = extract_json(text2) if ok2 else None
-            if obj is None:
-                # Its findings are missing from this round, so the panel is
-                # smaller than it looks. Never let that pass silently.
+                repaired = extract_json(text2) if ok2 else None
+                if repaired is not None and review_problem(repaired) is None:
+                    obj, problem = repaired, None
+            if problem:
+                # This reviewer did not report, so the panel is smaller than it
+                # looks. Never let that pass silently — and never as approval.
+                missing_reviewers.append(slot)
                 run.emit("review_unparsed", reviewer=slot,
-                         label=rv.get("label") or slot,
-                         reason="agent failed" if not ok_ else "unparseable output")
+                         label=rv.get("label") or slot, reason=problem)
+            # Findings from a malformed review are still kept: they can only
+            # make the gate stricter, and the slot is already counted missing.
             found = normalise_findings(slot, obj)
             (run_dir / f"review-{iteration:02d}-{slot}.json").write_text(
-                json.dumps(obj or {"verdict": "unparsed", "findings": []}, indent=2))
+                json.dumps(obj if isinstance(obj, dict) else
+                           {"verdict": "unparsed", "findings": []}, indent=2))
             counts = {s: sum(1 for x in found if x["severity"] == s) for s in SEVERITIES}
             run.emit("review_done", reviewer=slot,
                      label=rv.get("label") or slot,
-                     verdict=(obj or {}).get("verdict", "unparsed"),
+                     verdict=(_verdict(obj) if isinstance(obj, dict) else "") or "unparsed",
+                     usable=not problem,
                      counts={k: v for k, v in counts.items() if v})
             round_findings += found
 
+        panel_complete = not missing_reviewers
         merged = dedupe(round_findings)
         (run_dir / f"findings-{iteration:02d}.json").write_text(json.dumps(merged, indent=2))
-        all_findings = merged
+        ledger.record_round(iteration, merged, panel_complete=panel_complete)
+        (run_dir / "ledger.json").write_text(json.dumps(ledger.to_json(), indent=2))
 
         blockers = [f for f in merged if f["severity"] in blocking]
         run.emit("round_summary", iteration=iteration, total=len(merged),
-                 blocking=len(blockers), validation_passed=val_ok)
+                 blocking=len(blockers), validation_status=val_status,
+                 validation_passed=val_ok, panel_complete=panel_complete,
+                 missing_reviewers=sorted(set(missing_reviewers)))
 
-        if not blockers and val_ok:
-            outcome = "approved"
-            break
-        if not blockers and not val_ok:
+        # Approval needs all three: every reviewer reported, nothing blocking
+        # is open, and the independent gate actually ran and passed. A missing
+        # answer is not a clean one, and neither is a gate that never ran.
+        if not blockers:
+            if not panel_complete:
+                run.emit("warning", message="No blocking findings, but "
+                         f"{len(set(missing_reviewers))} reviewer(s) contributed nothing "
+                         "this round. The panel is incomplete, so this is not an approval.")
+                outcome = "review_incomplete"
+                break
+            if val_status == VALIDATION_NOT_CONFIGURED:
+                if config.get("allow_missing_validation"):
+                    run.emit("warning", message="Approving without an independent gate: "
+                             "no validation commands were configured and "
+                             "`allow_missing_validation` is set.")
+                    outcome = "approved_unverified"
+                else:
+                    outcome = "validation_not_configured"
+                break
+            if val_ok:
+                outcome = "approved"
+                break
             run.emit("warning", message="Reviewers approved but validation is failing; "
                                         "sending validation failures back to the implementer.")
 
@@ -1215,43 +1785,99 @@ def cmd_run(args: argparse.Namespace) -> int:
             break
         (run_dir / f"implementer-{iteration:02d}.md").write_text(text)
 
-    final = _write_final(run, base_sha, outcome, all_findings,
-                         rounds_run, last_val_ok, blocking)
+    open_now = ledger.open_findings()
+    final = _write_final(run, base_sha, outcome, ledger, rounds_run,
+                         val_status, blocking, baseline_status,
+                         sorted(set(missing_reviewers)))
     run.emit("run_complete", outcome=outcome, rounds=rounds_run,
-             findings=len(all_findings),
-             blocking_open=sum(1 for f in all_findings if f["severity"] in blocking),
-             validation_passed=last_val_ok, final=str(final))
-    return 0 if outcome == "approved" else 2
+             findings=len(ledger.entries), resolved=len(ledger.resolved()),
+             blocking_open=sum(1 for f in open_now if f["severity"] in blocking),
+             validation_status=val_status,
+             validation_passed=val_status == VALIDATION_PASSED,
+             missing_reviewers=sorted(set(missing_reviewers)),
+             final=str(final))
+    return exit_code(outcome)
 
 
-def _validation_note(ok: bool, results: list[dict[str, Any]], brief: bool = False) -> str:
+
+
+def _validation_note(status: str, results: list[dict[str, Any]],
+                     brief: bool = False, baseline: str | None = None) -> str:
     """Summarise validation.
 
     `brief` is for reviewers, who need to know whether the suite passes but
     cannot act on a stack trace — and who each pay for it separately, every
     round. The implementer gets the full output because it has to fix it.
     """
-    if not results:
-        return "No validation commands were configured for this run."
+    if status == VALIDATION_NOT_CONFIGURED or not results:
+        return ("No validation commands were configured for this run, so nothing "
+                "was independently verified. Treat every claim about behaviour as "
+                "unproven.")
     lines = ["Validation results (these are ground truth, not opinion):"]
     for r in results:
         lines.append(f"  {'PASS' if r['passed'] else 'FAIL'}  {r['command']}")
         if not r["passed"] and not brief:
             lines.append(textwrap.indent(r["output_tail"][-1500:], "      "))
-    if brief and not ok:
+    if brief and status != VALIDATION_PASSED:
         lines.append("  (failure output withheld; the build agent has it.)")
+    if baseline == VALIDATION_FAILED:
+        lines.append("  NOTE: validation was ALREADY FAILING before this task started. "
+                     "A failure here is not necessarily caused by the change under review.")
     return "\n".join(lines)
 
 
 def _new_run_dir(state: Path) -> Path:
+    """Reserve the next run directory by creating it.
+
+    Returning a name without claiming it lets two callers pick the same one and
+    then write over each other's config, progress stream and findings.
+    """
     history = state / "history"
     history.mkdir(parents=True, exist_ok=True)
     n = len([d for d in history.iterdir() if d.is_dir()]) + 1
-    return history / f"run-{n:02d}"
+    while True:
+        candidate = history / f"run-{n:02d}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
+# The exit code is the whole interface in CI, so it is a table rather than a
+# condition at each return site — that is how a fix-round failure came to exit
+# 2 while the identical failure before the first round exited 1.
+#   0  approved
+#   1  could not run or could not complete
+#   2  ran to a conclusion that is not an approval
+EXIT_CODES = {
+    "approved": 0,
+    "approved_unverified": 0,
+    "implementer_failed": 1,
+    "baseline_failed": 1,
+}
+
+
+def exit_code(outcome: str) -> int:
+    return EXIT_CODES.get(outcome, 2)
 
 
 OUTCOME_NOTE = {
-    "approved": "No blocking findings remain and validation passed.",
+    "approved": "Every reviewer reported, no blocking findings remain, and validation passed.",
+    "approved_unverified": "No blocking findings remain, but no validation commands were "
+                           "configured, so nothing was independently verified. This is a "
+                           "model-consensus result only — `allow_missing_validation` was set.",
+    "review_incomplete": "One or more reviewers contributed nothing, so the panel that "
+                         "reported was smaller than the one that was configured. The "
+                         "absence of findings from a reviewer that never answered is not "
+                         "evidence of correctness. Re-run, or review those areas by hand.",
+    "validation_not_configured": "No blocking findings remain, but no validation commands "
+                                 "were configured, so there was no independent gate and the "
+                                 "loop will not call this approved. Add validation commands "
+                                 "and re-run.",
+    "baseline_failed": "Validation was already failing before the task started, and "
+                       "`require_clean_baseline` was set. Fix the build first, or the "
+                       "gate cannot attribute anything to this change.",
     "max_iterations_reached": "The loop hit its iteration cap with blocking findings "
                               "still open. This needs a human — do not simply raise the cap.",
     "stopped_by_user": "Stopped on request. The working tree holds whatever the last "
@@ -1263,11 +1889,23 @@ OUTCOME_NOTE = {
 }
 
 
+VALIDATION_LABEL = {
+    VALIDATION_PASSED: "passing",
+    VALIDATION_FAILED: "FAILING",
+    VALIDATION_NOT_CONFIGURED: "NOT CONFIGURED — nothing was independently verified",
+}
+
+
 def _write_final(run: Run, base_sha: str | None, outcome: str,
-                 findings: list[dict[str, Any]], rounds: int,
-                 validation_passed: bool, blocking: set[str]) -> Path:
-    blockers = [f for f in findings if f["severity"] in blocking]
-    advisory = [f for f in findings if f["severity"] not in blocking]
+                 ledger: Ledger, rounds: int, validation_status: str,
+                 blocking: set[str], baseline_status: str = VALIDATION_NOT_CONFIGURED,
+                 missing_reviewers: list[str] | None = None) -> Path:
+    open_findings = ledger.open_findings()
+    resolved = ledger.resolved()
+    blockers = [f for f in open_findings if f["severity"] in blocking]
+    advisory = [f for f in open_findings if f["severity"] not in blocking]
+    reappeared = [f for f in open_findings if f["state"] == "reappeared"]
+    missing_reviewers = missing_reviewers or []
 
     lines = [
         "# Review loop result", "",
@@ -1275,10 +1913,25 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
         f"- Review rounds: {rounds}",
         f"- Base SHA: `{base_sha or '(no commits)'}`",
         f"- Reviewers: {', '.join(r.get('label') or r.get('slot_id') or r.get('persona', '?') for r in run.config.get('reviewers', []))}",
-        f"- Validation: {'passing' if validation_passed else 'FAILING'}",
+        f"- Validation: {VALIDATION_LABEL.get(validation_status, validation_status)}",
+        f"- Validation before the task started: "
+        f"{VALIDATION_LABEL.get(baseline_status, baseline_status)}",
+        f"- Findings raised across all rounds: {len(ledger.entries)}",
+        f"- Findings resolved: {len(resolved)}",
         f"- Blocking findings open: {len(blockers)}",
-        f"- Advisory findings recorded: {len(advisory)}", "",
+        f"- Advisory findings open: {len(advisory)}", "",
     ]
+    if missing_reviewers:
+        lines += [f"> **Panel incomplete.** These reviewers contributed nothing in the "
+                  f"final round: {', '.join(missing_reviewers)}. Their areas of the "
+                  f"change were not reviewed.", ""]
+    if reappeared:
+        lines += [f"> **{len(reappeared)} finding(s) came back after being fixed.** "
+                  f"A fix for them did not hold; they are marked below.", ""]
+    if rounds > 1:
+        lines += ["The implementer's response to each round — what it fixed and what it "
+                  "rejected, with its stated evidence — is in `implementer-NN.md` in this "
+                  "run directory.", ""]
 
     def section(title: str, items: list[dict[str, Any]], note: str) -> None:
         # Every mutation here must be a method call: an augmented assignment
@@ -1289,6 +1942,12 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
         for f in items:
             corr = f.get("corroborated_by")
             tag = (f" · independently raised by {', '.join(corr)}") if corr else ""
+            if f.get("state") == "reappeared":
+                tag += " · CAME BACK after being fixed"
+            elif f.get("state") == "resolved":
+                tag += f" · resolved in round {f.get('resolved_in', '?')}"
+            elif f.get("first_seen") and f["first_seen"] != f.get("last_seen"):
+                tag += f" · open since round {f['first_seen']}"
             loc = f["file"] + (f":{f['line']}" if f.get("line") else "")
             lines.extend([f"### [{f['severity'].upper()}] {f['id']} — {loc}{tag}", "",
                           f"**Problem.** {f['problem']}", "",
@@ -1300,8 +1959,13 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
     section("Advisory findings", advisory,
             "Below the blocking threshold. Recorded for your judgement; "
             "the loop did not iterate on them.")
+    section("Findings raised and resolved", resolved,
+            "Raised by the panel in an earlier round and no longer reported by a "
+            "complete panel. Kept for the record — a later round can bring one back.")
 
-    if not findings:
+    if not ledger.entries:
+        lines += ["## Findings", "", "None raised in any round.", ""]
+    elif not open_findings:
         lines += ["## Findings", "", "None outstanding.", ""]
 
     body = "\n".join(lines)
@@ -1321,27 +1985,45 @@ def cmd_start(args: argparse.Namespace) -> int:
     # Validate before detaching: a config error must surface here, where the
     # caller can still see it, not in a log file nobody is watching.
     problems = validate_config(config)
+    repo = Path(config.get("repo") or os.getcwd()).resolve()
+    problems += preflight_repo(repo, config)
     if problems:
         print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
               file=sys.stderr)
         return 1
-    repo = Path(config.get("repo") or os.getcwd()).resolve()
     state = repo / STATE_DIRNAME
-    state.mkdir(exist_ok=True)
+    _ensure_state_ignored(state)
+
+    # Claim the worktree before reserving a run directory or repointing
+    # `current-run`, so a second `start` cannot detach a run that would fight
+    # the first one. Our own pid holds the lock until the child adopts it.
+    token = new_lock_token()
+    held = acquire_lock(state, token, os.getpid())
+    if held:
+        print(json.dumps({"error": "run already active", "problems": [held]}, indent=2),
+              file=sys.stderr)
+        return 1
+
     run_dir = _new_run_dir(state)
-    run_dir.mkdir(parents=True, exist_ok=True)
     config["run_dir"] = str(run_dir)
+    config["lock_token"] = token
     resolved = run_dir / "config.json"
     resolved.write_text(json.dumps(config, indent=2))
 
-    _ensure_gitignore(repo)
-
     log = (run_dir / "run.log").open("w")
-    proc = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "run", "--config", str(resolved)],
-        cwd=str(repo), stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "run", "--config", str(resolved)],
+            cwd=str(repo), stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception:
+        handoff_lock(state, token, os.getpid(), run_dir)
+        release_lock(state, run_dir)
+        raise
+    # Name the child on the lock so the window between this process exiting and
+    # the child adopting does not look like a crashed run to the next caller.
+    handoff_lock(state, token, proc.pid, run_dir)
     (run_dir / "pid").write_text(str(proc.pid))
     (state / "current-run").write_text(str(run_dir))
     print(json.dumps({"run_dir": str(run_dir), "pid": proc.pid,
@@ -1349,16 +2031,20 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def _ensure_gitignore(repo: Path) -> None:
-    gi = repo / ".gitignore"
-    entry = f"{STATE_DIRNAME}/"
+def _ensure_state_ignored(state: Path) -> None:
+    """Make the state directory invisible to git without touching the repo.
+
+    Appending to the project's own `.gitignore` would leave an uncommitted
+    change behind — which the next run's dirty-tree check would then refuse to
+    start on, and which the user never asked for. A `.gitignore` holding `*`
+    inside the directory ignores the directory's contents and itself, so
+    `git status` stays clean and nothing outside `.review-loop/` is modified.
+    """
     try:
-        existing = gi.read_text() if gi.exists() else ""
-        if entry not in existing:
-            with gi.open("a") as fh:
-                if existing and not existing.endswith("\n"):
-                    fh.write("\n")
-                fh.write(f"\n# review-loop working state\n{entry}\n")
+        state.mkdir(exist_ok=True)
+        marker = state / ".gitignore"
+        if not marker.exists():
+            marker.write_text("# review-loop working state; not part of the project\n*\n")
     except Exception:
         pass
 
@@ -1484,7 +2170,15 @@ def cmd_render(args: argparse.Namespace) -> int:
             out.append(f"  ⚠ {e['label']} was blocked from running commands "
                        f"({e.get('count')} denials) — its result is unverified")
         elif ev == "validation_done":
-            out.append(f"  {'✓' if e.get('passed') else '✗'} validation: {e.get('command')}")
+            stage = " (baseline)" if e.get("stage") == "baseline" else ""
+            out.append(f"  {'✓' if e.get('passed') else '✗'} validation{stage}: "
+                       f"{e.get('command')}")
+        elif ev == "baseline_validation":
+            if e.get("status") == VALIDATION_NOT_CONFIGURED:
+                out.append("  ⚠ no validation commands configured — "
+                           "there is no independent gate on this run")
+            elif e.get("status") == VALIDATION_FAILED:
+                out.append("  ⚠ validation was already failing before the task started")
         elif ev == "iteration_start":
             out.append("")
             out.append(f"● Review round {e['iteration']}")
@@ -1508,9 +2202,12 @@ def cmd_render(args: argparse.Namespace) -> int:
                     if out[i].startswith("  │"):
                         out[i] = "     " + out[i][5:]
                         break
-            out.append(f"  → {plural(e.get('total'), 'finding')} after merge · "
-                       f"{e.get('blocking')} blocking · "
-                       f"validation {'passing' if e.get('validation_passed') else 'FAILING'}")
+            line = (f"  → {plural(e.get('total'), 'finding')} after merge · "
+                    f"{e.get('blocking')} blocking · validation "
+                    f"{VALIDATION_LABEL.get(e.get('validation_status'), 'FAILING' if not e.get('validation_passed') else 'passing')}")
+            if e.get("panel_complete") is False:
+                line += f" · PANEL INCOMPLETE ({', '.join(e.get('missing_reviewers') or [])})"
+            out.append(line)
             round_open = False
         elif ev == "warning":
             out.append(f"  ⚠ {e.get('message')}")
@@ -1533,9 +2230,14 @@ def cmd_render(args: argparse.Namespace) -> int:
             mark = "✓" if e.get("outcome") == "approved" else "■"
             out.append(f"{mark} {str(e.get('outcome', '')).replace('_', ' ').upper()}")
             out.append(f"  {plural(e.get('rounds'), 'round')} · "
-                       f"{plural(e.get('findings'), 'finding')} · "
+                       f"{plural(e.get('findings'), 'finding')} raised · "
+                       f"{e.get('resolved', 0)} resolved · "
                        f"{e.get('blocking_open')} blocking open · "
-                       f"validation {'passing' if e.get('validation_passed') else 'FAILING'}")
+                       f"validation "
+                       f"{VALIDATION_LABEL.get(e.get('validation_status'), 'FAILING' if not e.get('validation_passed') else 'passing')}")
+            if e.get("missing_reviewers"):
+                out.append(f"  ⚠ panel incomplete: "
+                           f"{', '.join(e['missing_reviewers'])} contributed nothing")
             spend = _spend(events)
             if spend:
                 out.append(f"  {spend}")
@@ -1556,18 +2258,32 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print(json.dumps({"error": "no run found"}))
         return 1
     (run_dir / "STOP").write_text("stop")
-    pid_file = run_dir / "pid"
-    if args.kill and pid_file.exists():
+    if args.kill:
+        pid = _locked_run_pid(run_dir)
+        if pid is None or not _pid_is_review_loop(pid, run_dir):
+            print(json.dumps({
+                "error": "refusing to signal an unverified process",
+                "run_dir": str(run_dir),
+                "hint": "The run is not actively locked by a matching review-loop process."
+            }), file=sys.stderr)
+            return 1
         try:
-            os.killpg(os.getpgid(int(pid_file.read_text().strip())), signal.SIGTERM)
-        except Exception:
-            pass
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception as exc:
+            print(json.dumps({"error": "could not stop run", "detail": str(exc)}),
+                  file=sys.stderr)
+            return 1
+        # Do not release here: SIGTERM is asynchronous and can fail. Keeping the
+        # lock until the pid is actually dead prevents a quick restart from
+        # overlapping the process being killed. The next acquisition safely
+        # reclaims locks whose recorded pid no longer exists.
     print(json.dumps({"stopping": str(run_dir)}))
     return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="review_loop")
+    p.add_argument("--version", action="version", version=f"%(prog)s {installed_version()}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("detect").set_defaults(func=cmd_detect)

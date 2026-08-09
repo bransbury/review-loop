@@ -1,5 +1,9 @@
 # review-loop
 
+[![CI](https://github.com/bransbury/review-loop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bransbury/review-loop/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/bransbury/review-loop)](https://github.com/bransbury/review-loop/releases)
+[![License](https://img.shields.io/github/license/bransbury/review-loop)](LICENSE)
+
 A configurable adversarial review panel for AI-assisted engineering work.
 
 One agent implements the task. A panel of reviewer personas — each with a
@@ -63,6 +67,34 @@ cd review-loop && ./install.sh
 
 Symlinks by default, so `git pull` updates every harness at once. Use
 `--copy` for independent copies, `--uninstall` to remove.
+
+## Update
+
+How to update depends on how review-loop was installed:
+
+| Installation | Update command |
+|---|---|
+| One-line installer | Re-run the `curl` installation command above. |
+| Cloned, default symlink | Run `git pull --ff-only` in the clone. |
+| Cloned with `--copy` | Pull the clone, then run `./install.sh --copy` again. |
+| Claude Code plugin | `claude plugin update review-loop@review-loop` |
+| Copilot CLI plugin | `copilot plugin update review-loop` |
+
+Restart the CLI after updating. Claude Code can instead run
+`/reload-plugins`. Third-party Claude marketplaces do not enable automatic
+updates by default; enable auto-update for the marketplace in `/plugin` if you
+want updates at startup.
+
+To see the installed orchestrator version:
+
+```bash
+python3 <skill-dir>/scripts/review_loop.py --version
+```
+
+review-loop uses Semantic Versioning while its interfaces settle. Release
+notes and upgrade guidance are published on the
+[GitHub Releases page](https://github.com/bransbury/review-loop/releases), and
+all notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 **Claude Code plugin:**
 
@@ -180,7 +212,33 @@ definition of correctness. Validation commands run every round, and failing
 tests keep the loop alive even when every reviewer approves.
 
 **Reviewers are read-only, enforced by flags.** `--permission-mode plan`,
-`--deny-tool write`, `-s read-only` — not a polite request in a prompt.
+`--deny-tool write --deny-tool shell`, `-s read-only` — not a polite request in
+a prompt. Copilot's `write` permission covers file-writing tools but explicitly
+not shell invocations, so its shell is denied outright; denying `git commit` and
+`git push` by name would still have left `sed -i`, `rm` and redirection.
+
+**A missing answer is not a clean one.** A review counts only if it parses
+*and* holds a real review: an explicit verdict, a `findings` list, objects
+inside it, and at least one finding when it asks for changes. A reviewer that
+fails, that returns something malformed twice, or that objects without naming
+anything makes the round incomplete, and the run ends `review_incomplete` —
+never `approved`. Every permissive reading of a malformed review normalises to
+zero findings, which is indistinguishable from a clean one. Silence from a
+reviewer that never answered is not evidence of correctness, and it does not
+resolve findings in the ledger either.
+
+**A gate that never ran did not pass.** Validation is `passed`, `failed` or
+`not_configured` — never a boolean that reads "true" when nothing executed. A
+config with no validation commands is rejected at launch; approving without one
+requires `allow_missing_validation` and reports as `approved_unverified`. A
+baseline run before the build agent starts records whether the suite was
+already failing, so a later failure is never misattributed to the change.
+
+**One run per worktree, and never on a tree it cannot reason about.** The
+orchestrator refuses to start on a non-git or dirty working tree unless
+explicitly allowed, and holds an atomic lock so two runs cannot edit the same
+files and race on `current-run`. It keeps its own state out of git with a
+`.gitignore` inside `.review-loop/`, so it never modifies a tracked file.
 
 **The loop is capped.** Five rounds by default. Past that it stops and asks for
 a human, rather than negotiating with itself indefinitely.
@@ -191,6 +249,12 @@ agent because a reviewer wanted a variable renamed.
 
 **Findings raised independently by two reviewers are marked
 `corroborated_by`** and treated as high-confidence.
+
+**Every finding is tracked across rounds, not just the last one.** A ledger
+records each defect once — matching it across rounds even when a reviewer
+rewords it — with a state of `open`, `resolved` or `reappeared`. That is what
+lets the final report say what was raised, what was fixed, and which fix did
+not hold, instead of showing whatever the final panel happened to repeat.
 
 ## Token efficiency
 
@@ -273,13 +337,17 @@ adds to `.gitignore` on first run.
 
 ```text
 .review-loop/
+  .gitignore                  keeps this directory out of git
   task.md
   final.md                    ← read this
+  lock                        one active run per worktree
   history/run-NN/
     config.json               resolved configuration
     progress.jsonl            event stream
-    findings-NN.json          merged, deduplicated
+    findings-NN.json          merged and deduplicated, this round only
+    ledger.json               every finding across rounds, with its state
     review-NN-<persona>.json  each reviewer's raw verdict
+    validation-00.json        baseline, before the build agent ran
     validation-NN.json        test/lint/typecheck results
     logs/                     full transcript per invocation
 ```
@@ -307,9 +375,12 @@ python3 skills/review-loop/scripts/review_loop.py run --config run.json
 
 | Exit | Meaning |
 |---|---|
-| `0` | Approved — no blocking findings, validation passing |
-| `1` | Could not run (build agent failed, no usable CLI) |
-| `2` | Finished with blocking findings outstanding, or hit the iteration cap |
+| `0` | Approved — full panel reported, no blocking findings, validation passing (or `approved_unverified` when `allow_missing_validation` is set) |
+| `1` | Could not run — invalid config, unsafe repository, another run already active, build agent failed, no usable CLI |
+| `2` | Finished with blocking findings outstanding, hit the iteration cap, or could not approve because the panel was incomplete or ungated |
+
+For CI, treat only exit `0` as a pass, and check `outcome` in `final.md` if you
+want to distinguish `approved` from `approved_unverified`.
 
 `status` and `stop` operate on the newest run in the current directory; pass
 `--repo <path>` or `--run <dir>` to target another.
@@ -317,9 +388,10 @@ python3 skills/review-loop/scripts/review_loop.py run --config run.json
 ## Known limits
 
 - **Only Codex can hard-constrain reviewer output to a JSON Schema**
-  (`--output-schema`). Claude and Copilot are asked for JSON and parsed
-  defensively, with one repair retry. Unparseable output is recorded, not
-  guessed at.
+  (`--output-schema`). Every adapter's output is therefore validated in code
+  for shape, not just parsed — an explicit verdict, a `findings` list, and
+  objects inside it — with one repair retry. Anything that fails is recorded as
+  a reviewer that did not report, never guessed at and never read as approval.
 - **Copilot model availability is governed by your GitHub organisation's
   policy.** The picker enumerates at runtime and falls back to `auto`.
 - **The build agent needs non-interactive write permission.** The default is
