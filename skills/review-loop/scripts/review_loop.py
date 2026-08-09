@@ -483,8 +483,14 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
         run.emit("agent_error", label=label, error=f"timed out after {timeout}s")
         return False, f"{label} timed out after {timeout}s"
 
+    # Transcripts are for debugging a run, not archiving it. Keep the head and
+    # tail of each stream: the middle of a long agent transcript is where the
+    # least useful bytes live.
+    log_cap = int(run.config.get("max_log_chars", 100_000))
     log_file.write_text(
-        f"$ {' '.join(argv[:6])} ...\n\n--- STDOUT ---\n{proc.stdout}\n--- STDERR ---\n{proc.stderr}"
+        f"$ {' '.join(argv[:6])} ...\n\n"
+        f"--- STDOUT ---\n{_head_tail(proc.stdout, log_cap)}\n"
+        f"--- STDERR ---\n{_head_tail(proc.stderr, log_cap // 4)}"
     )
 
     if ad["reads_out_file"] and out_file.exists():
@@ -539,6 +545,14 @@ def _usage(cli: str, stdout: str) -> dict[str, Any]:
         return out
     except Exception:
         return {}
+
+
+def _head_tail(text: str, limit: int) -> str:
+    if not text or len(text) <= limit:
+        return text or ""
+    half = limit // 2
+    cut = len(text) - limit
+    return f"{text[:half]}\n\n… [{cut:,} chars elided] …\n\n{text[-half:]}"
 
 
 def _permission_denials(cli: str, stdout: str) -> list[Any]:
@@ -620,7 +634,14 @@ def extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None) -> list[dict[str, Any]]:
+def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None,
+                       max_findings: int = 10) -> list[dict[str, Any]]:
+    """Parse and bound one reviewer's output.
+
+    Enforces in code what the prompt asks for: no nits, a finding cap, and
+    fields short enough that a panel's worth of them stays readable. A
+    reviewer that ignores the instruction cannot flood the loop.
+    """
     if not obj:
         return []
     out = []
@@ -630,6 +651,9 @@ def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None) -> list[dic
         sev = str(f.get("severity", "medium")).strip().lower()
         if sev not in SEVERITIES:
             sev = "medium"
+        if sev == "nit":
+            # Policy discards these, so carrying them costs tokens for nothing.
+            continue
         out.append({
             "id": f.get("id") or f"{reviewer_id.upper()}-{i + 1:03d}",
             "reviewer": reviewer_id,
@@ -637,11 +661,19 @@ def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None) -> list[dic
             "file": f.get("file") or "",
             "line": f.get("line"),
             "category": f.get("category") or "",
-            "problem": (f.get("problem") or "").strip(),
-            "impact": (f.get("impact") or "").strip(),
-            "recommended_fix": (f.get("recommended_fix") or "").strip(),
+            "problem": _clip(f.get("problem")),
+            "impact": _clip(f.get("impact")),
+            "recommended_fix": _clip(f.get("recommended_fix")),
         })
-    return out
+    # Most severe first, then bound. A reviewer that returns forty findings is
+    # padding, and the tail would be paid for by the implementer next round.
+    out.sort(key=lambda f: SEVERITIES.index(f["severity"]))
+    return out[:max_findings]
+
+
+def _clip(value: Any, limit: int = 600) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -955,7 +987,14 @@ Return ONLY a JSON object matching this shape, with no prose before or after it:
 Rules:
 - Return only actionable findings. Do not compliment the implementation.
 - Do not raise optional stylistic preferences.
-- If you find nothing actionable, return "approved" with an empty findings list.
+- Do not report `nit` findings. They are discarded unread.
+- Report at most 10 findings, most severe first. If you have more, you are
+  padding: keep the ones that would change what a reviewer does.
+- One or two sentences per field. No preamble, no restating the code, no
+  markdown inside the strings. `problem` states the defect, `impact` states
+  the consequence, `recommended_fix` states the action.
+- If you find nothing actionable, return "approved" with an empty findings
+  list. A clean review is a real outcome.
 - `line` may be null when a finding is not anchored to one line."""
 
 REPAIR_PROMPT = """\

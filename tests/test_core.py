@@ -79,6 +79,28 @@ class Normalise(unittest.TestCase):
         self.assertEqual(normalise_findings("qa", None), [])
         self.assertEqual(normalise_findings("qa", {"findings": ["nonsense", 42]}), [])
 
+    def test_nits_are_dropped(self):
+        # Policy discards them, so carrying them through costs tokens for nothing.
+        out = normalise_findings("qa", {"findings": [
+            {"severity": "nit", "file": "a.py", "problem": "rename this"},
+            {"severity": "high", "file": "a.py", "problem": "real defect"}]})
+        self.assertEqual([f["severity"] for f in out], ["high"])
+
+    def test_findings_are_capped_most_severe_first(self):
+        many = [{"severity": "low", "file": f"f{i}.py", "problem": f"p{i}"} for i in range(30)]
+        many.append({"severity": "blocker", "file": "boom.py", "problem": "the real one"})
+        out = normalise_findings("qa", {"findings": many}, max_findings=10)
+        self.assertEqual(len(out), 10)
+        # The blocker must survive the cap even though it arrived last.
+        self.assertEqual(out[0]["severity"], "blocker")
+
+    def test_long_fields_are_clipped_and_whitespace_collapsed(self):
+        out = normalise_findings("qa", {"findings": [
+            {"severity": "high", "file": "a.py", "problem": "x " * 800,
+             "impact": "line one\n\n   line two"}]})
+        self.assertLessEqual(len(out[0]["problem"]), 601)
+        self.assertEqual(out[0]["impact"], "line one line two")
+
 
 class Dedupe(unittest.TestCase):
     def test_merges_same_defect_described_differently(self):
