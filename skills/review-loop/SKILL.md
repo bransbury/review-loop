@@ -62,21 +62,17 @@ Load `~/.review-loop/defaults.json` if it exists and use it to pre-fill every an
 
 **Question 1 — Build agent.** Which model and effort implements the task. Default to the strongest model the invoking CLI offers, at `high`.
 
-**Question 2 — Reviewers.** Multi-select from the persona library returned by `detect`. Recommend a panel based on what the task actually touches rather than offering all nine every time:
+**Question 2 — Reviewers.** Do not make the user choose blind. Run:
 
-| The task involves | Suggest |
-|---|---|
-| Anything at all | Principal Engineer, Adversarial QA |
-| Auth, user input, external requests | Security Engineer |
-| A user-visible interface | UI/UX & Accessibility |
-| A public or shared interface | API & Contract |
-| Schema changes, migrations, bulk writes | Data & Migrations |
-| Hot paths, large collections, bundle size | Performance Engineer |
-| A TypeScript codebase | TypeScript & Type Design |
-| A new dependency or failure mode | Observability & Operations |
-| Thin or suspect test coverage | Test Engineer |
+```bash
+python3 <skill-dir>/scripts/review_loop.py suggest --task "<the task>"
+```
+
+It reads the task wording and the repository's tracked files and returns a recommended panel with a reason for each. Present those as the pre-selected options, with the rest of the library available underneath. Show the reason — "task mentions oauth, sso" tells the user more than the persona name does.
 
 Two or three reviewers is the useful range. More than four mostly produces duplicate findings and a slower loop; say so if the user picks a large panel.
+
+The same persona may appear twice on different models — that is a legitimate way to get two independent opinions from one lens, and the orchestrator gives each slot its own identity so they can corroborate each other.
 
 **Question 3 — Model and effort per reviewer.** Default every reviewer to the global default. Let the user override each one individually. Reviewers benefit from more effort than the implementer: they get one pass and no feedback.
 
@@ -126,22 +122,31 @@ Each reviewer slot accepts an optional `config_dir`, which sets `CLAUDE_CONFIG_D
 
 ## 4. Report progress
 
-Poll `progress.jsonl` in the run directory and render the tree. Do not poll faster than every 30 seconds, and do not echo raw events.
+Do not read `progress.jsonl` yourself or reformat it. Run:
+
+```bash
+python3 <skill-dir>/scripts/review_loop.py render
+```
+
+It prints the finished tree. Pass it through to the user as-is — it is already the output format, and re-rendering it wastes tokens and drifts between runs.
 
 ```text
-● Implementer — Claude Opus @ high
-  ✓ implementation complete
-  ✓ 47 tests passed
+review-loop · 2 reviewers · max 5 rounds
+  panel: principal-engineer, adversarial-qa
+
+● Implementer — claude opus @ high
+  ✓ complete (51.6s)
 
 ● Review round 1
-  ├─ Principal Engineer — Opus @ max
+  ✓ validation: npm test
+  ├─ Principal Engineer
   │  1 high, 2 medium
-  └─ Adversarial QA — GPT-5.6-Luna @ max
+  └─ Adversarial QA
      1 blocker, 1 medium
-
-● Sending 5 findings to implementer
-  ▸ running (04:12)
+  → 4 findings after merge · 4 blocking · validation passing
 ```
+
+Poll no faster than every 30 seconds.
 
 Between polls, tell the user they can keep working and that `status` and `stop` are available.
 

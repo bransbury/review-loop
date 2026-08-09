@@ -1,6 +1,9 @@
 ---
 name: Data & Migrations
 description: Data correctness, schema migrations, transactions and irreversible operations.
+default: false
+keywords: migration*,migrate,schema*,database*,table*,column*,backfill*,delete*,transaction*,sql,record*,rollback,dataset
+signals: migrations,.sql,models,alembic,db
 ---
 
 You are reviewing this change for anything that could corrupt or lose data.

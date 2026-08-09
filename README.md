@@ -48,16 +48,21 @@ information, and when the job is allowed to finish.
 Works with **Claude Code**, **GitHub Copilot CLI** and **Codex** — all three
 read `SKILL.md` from a per-user skills directory.
 
-**Universal (recommended).** Installs into every CLI found on your machine:
+**One line.** Installs into every CLI found on your machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bransbury/review-loop/main/install.sh | bash
+```
+
+Or from a clone, if you'd rather read it first:
 
 ```bash
 git clone https://github.com/bransbury/review-loop.git
-cd review-loop
-./install.sh
+cd review-loop && ./install.sh
 ```
 
 Symlinks by default, so `git pull` updates every harness at once. Use
-`--copy` if you would rather have independent copies, `--uninstall` to remove.
+`--copy` for independent copies, `--uninstall` to remove.
 
 **Claude Code plugin:**
 
@@ -84,12 +89,24 @@ distribution. There is nothing to `pip install`.
               Use the existing Redis infrastructure. Include tests and docs.
 ```
 
-You will be asked four things:
+You will be asked five things:
 
 1. **Build agent** — which model and effort implements the task.
-2. **Reviewers** — pick from the persona library. Two or three is the useful range.
-3. **Model and effort per reviewer** — each one independently.
-4. **Mixing** — whether reviewers may use a different CLI to the one you invoked from. Off by default.
+2. **Reviewers** — pre-selected for you. The tool reads your task wording and
+   the repository's files and recommends a panel, with a reason for each:
+
+   ```
+   $ review_loop.py suggest --task "Add SSO login with OAuth token refresh"
+     principal-engineer   <- always recommended
+     adversarial-qa       <- always recommended
+     security             <- task mentions login, oauth, sso
+   ```
+3. **Model and effort per reviewer** — each one independently. The same persona
+   may appear twice on different models; each slot keeps its own identity and
+   they can corroborate each other.
+4. **Mixing** — whether reviewers may use a different CLI to the one you invoked
+   from. Off by default.
+5. **Build agent permissions** — it needs to run your tests unattended.
 
 Then it runs detached and reports progress:
 
@@ -132,7 +149,23 @@ Then it runs detached and reports progress:
 | `typescript-types` | `any` leaks, unsound assertions, states that should be unrepresentable |
 
 Personas are plain markdown in `skills/review-loop/personas/`. Add your own by
-dropping a file in — it appears in the picker automatically.
+dropping a file in — it appears in the picker automatically. The frontmatter
+controls routing:
+
+```markdown
+---
+name: Security Engineer
+description: Authorization, injection, secrets, untrusted input.
+default: false                        # true = always recommended
+keywords: auth*,login,oauth,token*    # matched against the task wording
+signals: auth,session,middleware      # matched against tracked file paths
+---
+```
+
+Keywords match whole words, so `log` will not fire on `login`. A trailing `*`
+makes it a stem, so `optimi*` covers both spellings. Signals starting with `.`
+match file extensions; the rest must match a whole path segment, so `security`
+fires on `src/security/guard.ts` but not on `notes-about-security.md`.
 
 ## Why it is built this way
 
@@ -212,10 +245,12 @@ adds to `.gitignore` on first run.
 The orchestrator runs standalone, without an agent host — useful in CI:
 
 ```bash
-python3 skills/review-loop/scripts/review_loop.py detect
-python3 skills/review-loop/scripts/review_loop.py start  --config run.json   # detached
-python3 skills/review-loop/scripts/review_loop.py status --tail 20
-python3 skills/review-loop/scripts/review_loop.py stop
+review_loop.py detect                      # installed CLIs, their models and efforts
+review_loop.py suggest --task "..."        # recommend a reviewer panel
+review_loop.py start   --config run.json   # launch detached
+review_loop.py render                      # the progress tree, for humans
+review_loop.py status  --tail 20           # raw events, for scripts
+review_loop.py stop [--kill]
 ```
 
 `start` returns immediately and always exits `0`; the run continues in the

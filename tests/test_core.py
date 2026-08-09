@@ -18,7 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "review-loop" / "scripts"))
 
 from review_loop import (  # noqa: E402
-    STATE_DIRNAME, Run, dedupe, extract_json, normalise_findings, _write_final,
+    STATE_DIRNAME, Run, dedupe, extract_json, normalise_findings, validate_config,
+    _keyword_hit, _signal_hit, _write_final,
 )
 
 
@@ -119,6 +120,105 @@ class Dedupe(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(dedupe([]), [])
+
+
+class ValidateConfig(unittest.TestCase):
+    """Config errors must surface before launch, not as a silent clean review."""
+
+    def base(self, **over):
+        cfg = {"task": "do a thing",
+               "implementer": {"cli": "claude", "model": "opus", "effort": "high"},
+               "reviewers": [{"persona": "security", "cli": "claude", "effort": "max"}]}
+        cfg.update(over)
+        return cfg
+
+    def test_valid_config_passes(self):
+        self.assertEqual(validate_config(self.base()), [])
+
+    def test_no_reviewers_is_rejected(self):
+        # Otherwise the loop finds zero blockers and reports "approved".
+        self.assertTrue(any("reviewer" in e for e in validate_config(self.base(reviewers=[]))))
+
+    def test_empty_task_is_rejected(self):
+        self.assertTrue(any("task" in e for e in validate_config(self.base(task="   "))))
+
+    def test_unknown_cli_is_rejected(self):
+        cfg = self.base(reviewers=[{"persona": "security", "cli": "gemini"}])
+        self.assertTrue(any("gemini" in e for e in validate_config(cfg)))
+
+    def test_effort_must_be_supported_by_that_cli(self):
+        # `ultra` exists on codex but not on claude.
+        cfg = self.base(reviewers=[{"persona": "qa", "cli": "claude", "effort": "ultra"}])
+        self.assertTrue(any("ultra" in e for e in validate_config(cfg)))
+
+    def test_unknown_severity_is_rejected(self):
+        cfg = self.base(blocking_severities=["blocker", "urgent"])
+        self.assertTrue(any("urgent" in e for e in validate_config(cfg)))
+
+    def test_zero_iterations_is_rejected(self):
+        self.assertTrue(any("max_iterations" in e
+                            for e in validate_config(self.base(max_iterations=0))))
+
+    def test_duplicate_personas_get_distinct_slot_ids(self):
+        # Same persona on two models is a legitimate panel; their outputs must
+        # not overwrite each other.
+        cfg = self.base(reviewers=[{"persona": "security", "cli": "claude"},
+                                   {"persona": "security", "cli": "codex"}])
+        self.assertEqual(validate_config(cfg), [])
+        self.assertEqual([r["slot_id"] for r in cfg["reviewers"]],
+                         ["security", "security-2"])
+
+    def test_duplicate_slots_can_corroborate_each_other(self):
+        cfg = self.base(reviewers=[{"persona": "security", "cli": "claude"},
+                                   {"persona": "security", "cli": "codex"}])
+        validate_config(cfg)
+        ids = [r["slot_id"] for r in cfg["reviewers"]]
+        a = finding(ids[0], file="a.py", line=1, problem="missing ownership check on delete")
+        b = finding(ids[1], file="a.py", line=3, problem="ownership check missing before delete")
+        merged = dedupe(a + b)
+        self.assertEqual(len(merged), 1)
+        # The first slot's finding is kept; the second corroborates it.
+        self.assertEqual(merged[0]["reviewer"], ids[0])
+        self.assertEqual(merged[0]["corroborated_by"], [ids[1]])
+
+    def test_label_defaults_from_persona(self):
+        cfg = self.base()
+        validate_config(cfg)
+        self.assertEqual(cfg["reviewers"][0]["label"], "Security")
+
+
+class PanelRouting(unittest.TestCase):
+    """Signals decide which reviewers get suggested. A false positive wastes a
+    reviewer slot; a false negative silently drops the one that mattered."""
+
+    def test_whole_word_by_default(self):
+        # The bug this exists for: "log" firing on "login" and putting the
+        # observability reviewer on every auth task.
+        self.assertFalse(_keyword_hit("log", "add sso login support"))
+        self.assertTrue(_keyword_hit("log", "write a log line"))
+        self.assertTrue(_keyword_hit("login", "add sso login support"))
+
+    def test_star_suffix_matches_stems(self):
+        self.assertTrue(_keyword_hit("optimi*", "optimise the query"))
+        self.assertTrue(_keyword_hit("optimi*", "optimization pass"))
+        self.assertTrue(_keyword_hit("slow*", "it loads slowly"))
+        self.assertFalse(_keyword_hit("slow*", "unrelated text"))
+
+    def test_empty_keyword_never_matches(self):
+        self.assertFalse(_keyword_hit("", "anything at all"))
+
+    def test_signal_matches_whole_path_segment(self):
+        paths = ["src/security/guard.ts", "docs/readme.md"]
+        self.assertTrue(_signal_hit("security", paths))
+        # Must not fire on a file that merely contains the word in its name.
+        self.assertFalse(_signal_hit("security", ["personas/security.md"]))
+
+    def test_signal_extension_matches_suffix(self):
+        self.assertTrue(_signal_hit(".sql", ["db/migrations/001_init.sql"]))
+        self.assertFalse(_signal_hit(".sql", ["db/sqlhelper.py"]))
+
+    def test_empty_signal_never_matches(self):
+        self.assertFalse(_signal_hit("", ["a/b/c.py"]))
 
 
 class WriteFinal(unittest.TestCase):

@@ -1,6 +1,9 @@
 ---
 name: TypeScript & Type Design
 description: Type-level correctness and API ergonomics in TypeScript codebases. Skip for non-typed projects.
+default: false
+keywords: typescript,types,typing,generic*,type-safe,tsx
+signals: tsconfig.json,.ts,.tsx
 ---
 
 You are a TypeScript specialist reviewing how well the type system is being used to make wrong states unrepresentable.

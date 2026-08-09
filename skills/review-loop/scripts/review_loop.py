@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -200,6 +201,88 @@ def cmd_detect(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_suggest(args: argparse.Namespace) -> int:
+    """Recommend a review panel from the task text and the repository.
+
+    Picking reviewers blind is the hardest part of configuring a run, and a
+    panel that misses the security reviewer on an auth change is worse than
+    useless. This is advisory only — the wizard still asks.
+    """
+    repo = Path(args.repo or os.getcwd()).resolve()
+    task = (args.task or "").lower()
+
+    paths = [p.lower() for p in git(repo, "ls-files").splitlines()][:5000]
+
+    suggested, considered = [], []
+    for path in sorted(PERSONA_DIR.glob("*.md")):
+        meta = _persona_meta(path)
+        reasons = []
+        is_default = str(meta.get("default", "")).lower() == "true"
+        if is_default:
+            reasons.append("always recommended")
+
+        hits = [k for k in _csv(meta.get("keywords")) if _keyword_hit(k, task)]
+        if hits:
+            reasons.append("task mentions " + ", ".join(sorted({h.rstrip("*") for h in hits})[:4]))
+
+        sig = [s for s in _csv(meta.get("signals")) if _signal_hit(s, paths)]
+        if sig:
+            reasons.append("repository contains " + ", ".join(sorted(set(sig))[:4]))
+
+        entry = {"id": path.stem, "name": meta.get("name", path.stem),
+                 "description": meta.get("description", ""), "reasons": reasons,
+                 # Ranking only; stripped before output.
+                 "_rank": (0 if is_default else 1, -len(hits), -len(sig))}
+        (suggested if reasons else considered).append(entry)
+
+    # More than four reviewers mostly produces duplicate findings and a slower
+    # loop. Defaults first, then whatever the task itself argued for.
+    suggested.sort(key=lambda e: e["_rank"])
+    if len(suggested) > 4:
+        suggested, trimmed = suggested[:4], suggested[4:]
+        considered = trimmed + considered
+    for e in suggested + considered:
+        e.pop("_rank", None)
+
+    print(json.dumps({"repo": str(repo), "suggested": suggested,
+                      "other_personas": considered,
+                      "note": "Advisory only. Two or three reviewers is the useful range."},
+                     indent=2))
+    return 0
+
+
+def _csv(value: Any) -> list[str]:
+    return [v.strip().lower() for v in str(value or "").split(",") if v.strip()]
+
+
+def _keyword_hit(keyword: str, text: str) -> bool:
+    """Match a persona keyword against the task description.
+
+    Whole words by default, so "log" does not fire on "login". A trailing `*`
+    asks for prefix matching, for stems like `optimi*` that need to cover both
+    spellings.
+    """
+    if not keyword:
+        return False
+    if keyword.endswith("*"):
+        return re.search(rf"\b{re.escape(keyword[:-1])}\w*", text) is not None
+    return re.search(rf"\b{re.escape(keyword)}\b", text) is not None
+
+
+def _signal_hit(signal: str, paths: list[str]) -> bool:
+    """Match a repository signal against tracked file paths.
+
+    Extensions (".tsx") match a suffix; everything else must match a whole
+    path segment, so a `security` signal fires on `src/security/...` but not
+    on an unrelated file that merely has the word in its name.
+    """
+    if not signal:
+        return False
+    if signal.startswith("."):
+        return any(p.endswith(signal) for p in paths)
+    return any(signal in p.strip("/").split("/") for p in paths)
+
+
 def _invoking_harness() -> str | None:
     """Best-effort guess at which harness is running us, for wizard defaults."""
     if os.environ.get("CLAUDE_CODE") or os.environ.get("CLAUDECODE"):
@@ -226,6 +309,78 @@ def _persona_meta(path: Path) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def validate_config(config: dict[str, Any]) -> list[str]:
+    """Check a run config and assign a unique slot id to every reviewer.
+
+    Mutates `config` in place. Returns human-readable errors; an empty list
+    means the run is safe to start. Catching these before launch matters: a
+    config with no reviewers would otherwise "approve" instantly and look
+    like a clean review.
+    """
+    errors: list[str] = []
+
+    if not str(config.get("task", "")).strip():
+        errors.append("`task` is required and cannot be empty.")
+
+    impl = config.get("implementer")
+    if not isinstance(impl, dict):
+        errors.append("`implementer` is required.")
+    elif impl.get("cli") not in ADAPTERS:
+        errors.append(f"implementer.cli must be one of {sorted(ADAPTERS)}, "
+                      f"got {impl.get('cli')!r}.")
+
+    reviewers = config.get("reviewers")
+    if not isinstance(reviewers, list) or not reviewers:
+        errors.append("At least one reviewer is required.")
+        reviewers = []
+
+    seen: dict[str, int] = {}
+    for i, rv in enumerate(reviewers):
+        if not isinstance(rv, dict):
+            errors.append(f"reviewers[{i}] must be an object.")
+            continue
+        persona = rv.get("persona")
+        if not persona:
+            errors.append(f"reviewers[{i}].persona is required.")
+            continue
+        if rv.get("cli") not in ADAPTERS:
+            errors.append(f"reviewers[{i}].cli must be one of {sorted(ADAPTERS)}, "
+                          f"got {rv.get('cli')!r}.")
+        # The same persona may legitimately appear twice on different models.
+        # Give each slot a unique id so their outputs, log files and finding
+        # ids stay distinct — and so they can corroborate each other.
+        seen[persona] = seen.get(persona, 0) + 1
+        rv["slot_id"] = persona if seen[persona] == 1 else f"{persona}-{seen[persona]}"
+        rv.setdefault("label", persona.replace("-", " ").title())
+
+    for slot in ([impl] if isinstance(impl, dict) else []) + \
+                [r for r in reviewers if isinstance(r, dict)]:
+        cli = slot.get("cli")
+        ad = ADAPTERS.get(cli)
+        if ad and not shutil.which(ad["bin"]):
+            errors.append(f"`{ad['bin']}` is configured but not on PATH.")
+        effort = slot.get("effort")
+        if ad and effort and effort not in ad["efforts"]:
+            errors.append(f"effort {effort!r} is not supported by {cli}; "
+                          f"choose from {ad['efforts']}.")
+
+    bad = set(config.get("blocking_severities") or []) - set(SEVERITIES)
+    if bad:
+        errors.append(f"unknown blocking severities: {sorted(bad)}")
+
+    try:
+        if int(config.get("max_iterations", 5)) < 1:
+            errors.append("`max_iterations` must be at least 1.")
+    except (TypeError, ValueError):
+        errors.append("`max_iterations` must be a number.")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Run state
 # ---------------------------------------------------------------------------
 
@@ -236,13 +391,18 @@ class Run:
         self.config = config
         self.progress = run_dir / "progress.jsonl"
         self.stop_file = run_dir / "STOP"
+        # Reviewers run concurrently and all emit here; without this the
+        # progress stream can interleave into unparseable lines.
+        self._lock = threading.Lock()
 
     def emit(self, event: str, **fields: Any) -> None:
         rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
-        with self.progress.open("a") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        # Also echo for foreground/log tailing.
-        print(json.dumps(rec), flush=True)
+        line = json.dumps(rec)
+        with self._lock:
+            with self.progress.open("a") as fh:
+                fh.write(line + "\n")
+            # Also echo for foreground/log tailing.
+            print(line, flush=True)
 
     def should_stop(self) -> bool:
         return self.stop_file.exists()
@@ -644,12 +804,19 @@ code in the repository rather than reviewing this diff in isolation.
 Review the implementation from scratch. Do not assume previous review rounds
 were correct or complete, and look for regressions introduced by recent fixes.
 
+{shape}
+"""
+
+# Shared by the review prompt and the repair prompt. The repair runs as a fresh
+# session with no memory of the original instructions, so it must carry the
+# full shape with it rather than referring back to it.
+OUTPUT_SHAPE = """\
 Return ONLY a JSON object matching this shape, with no prose before or after it:
 
-{{
+{
   "verdict": "approved" | "changes_requested",
   "findings": [
-    {{
+    {
       "id": "SHORT-001",
       "severity": "blocker" | "high" | "medium" | "low" | "nit",
       "file": "path/to/file.ts",
@@ -658,14 +825,28 @@ Return ONLY a JSON object matching this shape, with no prose before or after it:
       "problem": "What is wrong.",
       "impact": "Why it matters.",
       "recommended_fix": "What to do instead."
-    }}
+    }
   ]
-}}
+}
 
 Rules:
 - Return only actionable findings. Do not compliment the implementation.
 - Do not raise optional stylistic preferences.
 - If you find nothing actionable, return "approved" with an empty findings list.
+- `line` may be null when a finding is not anchored to one line."""
+
+REPAIR_PROMPT = """\
+Your previous response could not be parsed as JSON.
+
+Below is what you produced. Convert it faithfully into the required JSON
+object. Do not re-review anything, do not add findings that are not already
+present, and do not drop any.
+
+{shape}
+
+<previous_response>
+{previous}
+</previous_response>
 """
 
 
@@ -683,6 +864,11 @@ def load_persona(persona_id: str) -> str:
 
 def cmd_run(args: argparse.Namespace) -> int:
     config = json.loads(Path(args.config).read_text())
+    problems = validate_config(config)
+    if problems:
+        print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
+              file=sys.stderr)
+        return 1
     repo = Path(config.get("repo") or os.getcwd()).resolve()
     state = repo / STATE_DIRNAME
     state.mkdir(exist_ok=True)
@@ -694,16 +880,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
     (state / "task.md").write_text(config["task"])
 
+    task = config["task"]
+    blocking = set(config.get("blocking_severities") or ["blocker", "high", "medium"])
+    max_iter = int(config.get("max_iterations", 5))
+
     base_sha = base_commit(repo)
     if base_sha is None:
         run.emit("warning", message="Repository has no commits; reviewing the whole working tree.")
     run.emit("run_start", repo=str(repo), base_sha=base_sha,
-             reviewers=[r["persona"] for r in config["reviewers"]],
-             max_iterations=config.get("max_iterations", 5))
-
-    task = config["task"]
-    blocking = set(config.get("blocking_severities") or ["blocker", "high", "medium"])
-    max_iter = int(config.get("max_iterations", 5))
+             reviewers=[r["slot_id"] for r in config["reviewers"]],
+             max_iterations=max_iter)
 
     # --- initial implementation -------------------------------------------
     cmds = (config.get("validation") or {}).get("commands") or []
@@ -718,7 +904,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                             readonly=False, label="Implementer",
                             log_name="iter00-implementer", attempts=2)
     if not ok:
+        # Still write the report and emit run_complete: whoever is polling the
+        # progress stream must never be left waiting for an event that is not
+        # coming.
         run.emit("run_failed", stage="implement", error=text)
+        final = _write_final(run, base_sha, "implementer_failed", [], 0, False, blocking)
+        run.emit("run_complete", outcome="implementer_failed", rounds=0, findings=0,
+                 blocking_open=0, validation_passed=False, final=str(final),
+                 error=text[:400])
         return 1
     (run_dir / "implementer-00.md").write_text(text)
 
@@ -755,11 +948,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             prompt = REVIEW_PROMPT.format(
                 persona=load_persona(rv["persona"]),
                 task=task, diff=diff, validation_note=validation_note,
+                shape=OUTPUT_SHAPE,
             )
             ok_, text_ = invoke_agent(
                 run, rv, prompt, readonly=True,
-                label=rv.get("label") or rv["persona"],
-                log_name=f"iter{iteration:02d}-{rv['persona']}",
+                label=rv.get("label") or rv["slot_id"],
+                log_name=f"iter{iteration:02d}-{rv['slot_id']}",
             )
             return rv, ok_, text_
 
@@ -770,24 +964,29 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         round_findings: list[dict[str, Any]] = []
         for rv, ok_, text_ in results:
+            slot = rv["slot_id"]
             obj = extract_json(text_) if ok_ else None
             if ok_ and obj is None:
-                # One repair attempt: hand the output back and demand JSON only.
-                repair = ("Your previous response was not valid JSON. Return ONLY the JSON "
-                          "object described earlier, with no prose.\n\n<previous>\n"
-                          + text_[:8000] + "\n</previous>")
-                ok2, text2 = invoke_agent(run, rv, repair, readonly=True,
-                                          label=f"{rv['persona']} (repair)",
-                                          log_name=f"iter{iteration:02d}-{rv['persona']}-repair")
+                # One repair attempt. This is a fresh session, so the required
+                # shape has to travel with the request.
+                ok2, text2 = invoke_agent(
+                    run, rv,
+                    REPAIR_PROMPT.format(shape=OUTPUT_SHAPE, previous=text_[:8000]),
+                    readonly=True, label=f"{rv.get('label') or slot} (repair)",
+                    log_name=f"iter{iteration:02d}-{slot}-repair")
                 obj = extract_json(text2) if ok2 else None
-                if obj is None:
-                    run.emit("review_unparsed", reviewer=rv["persona"])
-            found = normalise_findings(rv["persona"], obj)
-            (run_dir / f"review-{iteration:02d}-{rv['persona']}.json").write_text(
+            if obj is None:
+                # Its findings are missing from this round, so the panel is
+                # smaller than it looks. Never let that pass silently.
+                run.emit("review_unparsed", reviewer=slot,
+                         label=rv.get("label") or slot,
+                         reason="agent failed" if not ok_ else "unparseable output")
+            found = normalise_findings(slot, obj)
+            (run_dir / f"review-{iteration:02d}-{slot}.json").write_text(
                 json.dumps(obj or {"verdict": "unparsed", "findings": []}, indent=2))
             counts = {s: sum(1 for x in found if x["severity"] == s) for s in SEVERITIES}
-            run.emit("review_done", reviewer=rv["persona"],
-                     label=rv.get("label") or rv["persona"],
+            run.emit("review_done", reviewer=slot,
+                     label=rv.get("label") or slot,
                      verdict=(obj or {}).get("verdict", "unparsed"),
                      counts={k: v for k, v in counts.items() if v})
             round_findings += found
@@ -873,7 +1072,7 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
         f"**Outcome: {outcome}** — {OUTCOME_NOTE.get(outcome, '')}", "",
         f"- Review rounds: {rounds}",
         f"- Base SHA: `{base_sha or '(no commits)'}`",
-        f"- Reviewers: {', '.join(r.get('label') or r['persona'] for r in run.config['reviewers'])}",
+        f"- Reviewers: {', '.join(r.get('label') or r.get('slot_id') or r.get('persona', '?') for r in run.config.get('reviewers', []))}",
         f"- Validation: {'passing' if validation_passed else 'FAILING'}",
         f"- Blocking findings open: {len(blockers)}",
         f"- Advisory findings recorded: {len(advisory)}", "",
@@ -917,6 +1116,13 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
 def cmd_start(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     config = json.loads(config_path.read_text())
+    # Validate before detaching: a config error must surface here, where the
+    # caller can still see it, not in a log file nobody is watching.
+    problems = validate_config(config)
+    if problems:
+        print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
+              file=sys.stderr)
+        return 1
     repo = Path(config.get("repo") or os.getcwd()).resolve()
     state = repo / STATE_DIRNAME
     state.mkdir(exist_ok=True)
@@ -997,6 +1203,115 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    """Turn the event stream into the progress tree.
+
+    The script owns this so every host renders it identically and nobody has
+    to spend tokens reformatting JSON.
+    """
+    run_dir = _resolve_run(args)
+    if not run_dir or not (run_dir / "progress.jsonl").exists():
+        print("No review-loop run found here.")
+        return 1
+
+    events = []
+    for line in (run_dir / "progress.jsonl").read_text().splitlines():
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+
+    out: list[str] = []
+    agents: dict[str, dict[str, Any]] = {}
+    round_open = False
+
+    def plural(n: Any, word: str) -> str:
+        return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+    def sev_summary(counts: dict[str, int]) -> str:
+        parts = [f"{n} {s}" for s, n in
+                 sorted(counts.items(), key=lambda kv: SEV_ORDER.get(kv[0], 9)) if n]
+        return ", ".join(parts) if parts else "approved — no findings"
+
+    for e in events:
+        ev = e.get("event")
+        if ev == "run_start":
+            revs = ", ".join(e.get("reviewers") or [])
+            out.append(f"review-loop · {plural(len(e.get('reviewers') or []), 'reviewer')} "
+                       f"· max {plural(e.get('max_iterations'), 'round')}")
+            out.append(f"  panel: {revs}")
+            out.append("")
+        elif ev == "agent_start":
+            agents[e["label"]] = e
+            if not e.get("readonly"):
+                model = " ".join(x for x in (e.get("cli"), e.get("model")) if x)
+                eff = f" @ {e['effort']}" if e.get("effort") else ""
+                out.append(f"● {e['label']} — {model}{eff}")
+                out.append("  ▸ running…")
+        elif ev == "agent_done":
+            if not agents.get(e["label"], {}).get("readonly"):
+                if out and out[-1].strip() == "▸ running…":
+                    out.pop()
+                out.append(f"  ✓ complete ({e.get('seconds')}s)")
+        elif ev == "agent_error":
+            out.append(f"  ✗ {e['label']} failed: {str(e.get('error'))[:120]}")
+        elif ev == "permission_denied":
+            out.append(f"  ⚠ {e['label']} was blocked from running commands "
+                       f"({e.get('count')} denials) — its result is unverified")
+        elif ev == "validation_done":
+            out.append(f"  {'✓' if e.get('passed') else '✗'} validation: {e.get('command')}")
+        elif ev == "iteration_start":
+            out.append("")
+            out.append(f"● Review round {e['iteration']}")
+            round_open = True
+        elif ev == "review_done":
+            counts = e.get("counts") or {}
+            out.append(f"  ├─ {e.get('label')}")
+            out.append(f"  │  {sev_summary(counts)}")
+        elif ev == "review_unparsed":
+            out.append(f"  ├─ {e.get('label')}")
+            out.append(f"  │  ⚠ no usable output ({e.get('reason')}) — "
+                       f"this reviewer contributed nothing")
+        elif ev == "round_summary":
+            if round_open:
+                # Turn the last branch into the closing one.
+                for i in range(len(out) - 1, -1, -1):
+                    if out[i].startswith("  ├─"):
+                        out[i] = "  └─" + out[i][4:]
+                        break
+                for i in range(len(out) - 1, -1, -1):
+                    if out[i].startswith("  │"):
+                        out[i] = "     " + out[i][5:]
+                        break
+            out.append(f"  → {plural(e.get('total'), 'finding')} after merge · "
+                       f"{e.get('blocking')} blocking · "
+                       f"validation {'passing' if e.get('validation_passed') else 'FAILING'}")
+            round_open = False
+        elif ev == "warning":
+            out.append(f"  ⚠ {e.get('message')}")
+        elif ev == "run_complete":
+            out.append("")
+            out.append("━" * 52)
+            mark = "✓" if e.get("outcome") == "approved" else "■"
+            out.append(f"{mark} {str(e.get('outcome', '')).replace('_', ' ').upper()}")
+            out.append(f"  {plural(e.get('rounds'), 'round')} · "
+                       f"{plural(e.get('findings'), 'finding')} · "
+                       f"{e.get('blocking_open')} blocking open · "
+                       f"validation {'passing' if e.get('validation_passed') else 'FAILING'}")
+            out.append(f"  report: {e.get('final')}")
+            out.append("━" * 52)
+
+    if not any(e.get("event") == "run_complete" for e in events):
+        out.append("")
+        out.append("  ▸ still running — re-run `render` for an update")
+
+    print("\n".join(out))
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     run_dir = _resolve_run(args)
     if not run_dir:
@@ -1019,6 +1334,10 @@ def main() -> int:
 
     sub.add_parser("detect").set_defaults(func=cmd_detect)
 
+    sg = sub.add_parser("suggest", help="recommend a reviewer panel for a task")
+    sg.add_argument("--task", default=""); sg.add_argument("--repo")
+    sg.set_defaults(func=cmd_suggest)
+
     s = sub.add_parser("start"); s.add_argument("--config", required=True)
     s.set_defaults(func=cmd_start)
 
@@ -1029,6 +1348,10 @@ def main() -> int:
     st.add_argument("--run"); st.add_argument("--repo")
     st.add_argument("--tail", type=int, default=40)
     st.set_defaults(func=cmd_status)
+
+    rn = sub.add_parser("render", help="print the progress tree for a run")
+    rn.add_argument("--run"); rn.add_argument("--repo")
+    rn.set_defaults(func=cmd_render)
 
     sp = sub.add_parser("stop")
     sp.add_argument("--run"); sp.add_argument("--repo")

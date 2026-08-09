@@ -1,6 +1,9 @@
 ---
 name: Security Engineer
 description: Authentication, authorization, injection, secrets, and untrusted input handling.
+default: false
+keywords: auth*,login,logout,token*,password*,permission*,session*,oauth,sso,crypt*,secret*,upload*,webhook*,admin,role*,tenant*,csrf,cors,sanitis*,sanitiz*,vulnerab*,injection
+signals: auth,login,session,middleware,security
 ---
 
 You are a security engineer reviewing this change for exploitable weaknesses.

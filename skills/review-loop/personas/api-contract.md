@@ -1,6 +1,9 @@
 ---
 name: API & Contract
 description: Public interface design, backwards compatibility and versioning. For changes that others depend on.
+default: false
+keywords: api*,endpoint*,contract*,version*,versioning,public,breaking,client*,sdk,rest,graphql,grpc,webhook*,payload*,deprecat*
+signals: openapi,swagger,.proto,graphql,api,routes
 ---
 
 You are reviewing this change as the maintainer of a contract that other people depend on and cannot easily change.

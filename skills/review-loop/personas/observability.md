@@ -1,6 +1,9 @@
 ---
 name: Observability & Operations
 description: Whether this change can be diagnosed at 3am — logging, metrics, errors and failure visibility.
+default: false
+keywords: log,logs,logging,logger,metric*,alert*,monitor*,tracing,trace,retry,retries,timeout*,queue*,worker*,incident*,healthcheck,observab*
+signals: 
 ---
 
 You are a senior operations engineer. Your question is simple: when this breaks in production, will anyone be able to tell what happened?

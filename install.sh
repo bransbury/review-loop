@@ -13,9 +13,34 @@
 
 set -euo pipefail
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/skills/review-loop"
 NAME="review-loop"
 MODE="link"
+REPO_URL="${REVIEW_LOOP_REPO:-https://github.com/bransbury/review-loop.git}"
+CHECKOUT="${HOME}/.review-loop/src"
+
+# Resolve the source tree. When this file is run from a clone, that clone is
+# the source. When it is piped straight from curl there is no surrounding
+# checkout, so fetch one into ~/.review-loop/src and install from there.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+  ROOT=""
+fi
+
+if [ -n "$ROOT" ] && [ -d "${ROOT}/skills/${NAME}" ]; then
+  SRC="${ROOT}/skills/${NAME}"
+else
+  echo "Fetching ${NAME} into ${CHECKOUT}…"
+  if [ -d "${CHECKOUT}/.git" ]; then
+    git -C "$CHECKOUT" pull --quiet --ff-only || {
+      echo "error: could not update ${CHECKOUT}" >&2; exit 1; }
+  else
+    mkdir -p "$(dirname "$CHECKOUT")"
+    git clone --quiet --depth 1 "$REPO_URL" "$CHECKOUT" || {
+      echo "error: could not clone ${REPO_URL}" >&2; exit 1; }
+  fi
+  SRC="${CHECKOUT}/skills/${NAME}"
+fi
 
 for arg in "$@"; do
   case "$arg" in
