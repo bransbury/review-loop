@@ -1,0 +1,15 @@
+{
+  "name": "review-loop",
+  "description": "A configurable adversarial review panel for AI-assisted engineering work.",
+  "owner": {
+    "name": "Marcus Bransbury"
+  },
+  "plugins": [
+    {
+      "name": "review-loop",
+      "source": "./",
+      "description": "Implement a task with a build agent, then have a configurable panel of adversarial reviewer personas review it in parallel, fix the findings, and re-review from scratch until tests pass and no blocking findings remain.",
+      "skills": ["skills/review-loop"]
+    }
+  ]
+}

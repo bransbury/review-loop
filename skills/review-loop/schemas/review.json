@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approved", "changes_requested"],
+      "description": "approved only when there is nothing actionable to report."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Actionable defects only. Empty when the verdict is approved.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "_comment": "Every property is listed in `required` because OpenAI-style structured output rejects strict schemas with optional keys. Fields that may be absent use a nullable type instead.",
+        "required": ["id", "severity", "file", "line", "category", "problem", "impact", "recommended_fix"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Short stable identifier, e.g. SEC-001."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "high", "medium", "low", "nit"]
+          },
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path."
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "description": "1-indexed line the finding anchors to, or null."
+          },
+          "category": {
+            "type": "string",
+            "description": "Short slug, e.g. correctness, authorization, race-condition."
+          },
+          "problem": {
+            "type": "string",
+            "description": "What is wrong, stated concretely."
+          },
+          "impact": {
+            "type": "string",
+            "description": "Why it matters. The failure it causes."
+          },
+          "recommended_fix": {
+            "type": "string",
+            "description": "What to do instead."
+          }
+        }
+      }
+    }
+  }
+}

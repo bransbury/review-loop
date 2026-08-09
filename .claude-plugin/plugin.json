@@ -1,0 +1,12 @@
+{
+  "name": "review-loop",
+  "version": "0.1.0",
+  "description": "Implement a task with a build agent, then have a configurable panel of adversarial reviewer personas review it in parallel, fix the findings, and re-review from scratch until tests pass and no blocking findings remain.",
+  "author": {
+    "name": "Marcus Bransbury",
+    "email": "marcus.bransbury@gmail.com"
+  },
+  "homepage": "https://github.com/bransbury/review-loop",
+  "license": "MIT",
+  "keywords": ["code-review", "orchestration", "multi-agent", "qa", "security"]
+}
