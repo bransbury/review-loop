@@ -354,7 +354,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         # ids stay distinct — and so they can corroborate each other.
         seen[persona] = seen.get(persona, 0) + 1
         rv["slot_id"] = persona if seen[persona] == 1 else f"{persona}-{seen[persona]}"
-        rv.setdefault("label", persona.replace("-", " ").title())
+        # Prefer the persona's own name ("Adversarial QA") over title-casing
+        # the slug, which mangles acronyms into "Adversarial Qa".
+        if not rv.get("label"):
+            meta = _persona_meta(PERSONA_DIR / f"{persona}.md") \
+                if (PERSONA_DIR / f"{persona}.md").exists() else {}
+            rv["label"] = meta.get("name") or persona.replace("-", " ").title()
+        if seen[persona] > 1:
+            rv["label"] = f"{rv['label']} #{seen[persona]}"
 
     for slot in ([impl] if isinstance(impl, dict) else []) + \
                 [r for r in reviewers if isinstance(r, dict)]:
@@ -505,8 +512,33 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
                  error="agent produced no output", seconds=elapsed)
         return False, "agent produced no output"
 
-    run.emit("agent_done", label=label, seconds=elapsed, chars=len(text))
+    run.emit("agent_done", label=label, seconds=elapsed, chars=len(text),
+             prompt_chars=len(prompt), **_usage(cli, proc.stdout))
     return True, text
+
+
+def _usage(cli: str, stdout: str) -> dict[str, Any]:
+    """Pull real token and cost figures out of the CLI's response envelope.
+
+    Only Claude reports these today. Where a CLI does not, spend stays
+    unreported rather than being guessed at from character counts.
+    """
+    if cli != "claude":
+        return {}
+    try:
+        env = json.loads(stdout)
+        u = env.get("usage") or {}
+        out: dict[str, Any] = {}
+        for key, name in (("input_tokens", "in"), ("output_tokens", "out"),
+                          ("cache_read_input_tokens", "cache_read"),
+                          ("cache_creation_input_tokens", "cache_write")):
+            if isinstance(u.get(key), int):
+                out[f"tok_{name}"] = u[key]
+        if isinstance(env.get("total_cost_usd"), (int, float)):
+            out["cost_usd"] = round(env["total_cost_usd"], 4)
+        return out
+    except Exception:
+        return {}
 
 
 def _permission_denials(cli: str, stdout: str) -> list[Any]:
@@ -660,34 +692,121 @@ def base_commit(repo: Path) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def current_diff(repo: Path, base_sha: str | None) -> str:
-    """Everything the implementer changed: committed, staged, unstaged, new."""
-    parts = []
-    if base_sha:
-        # Committed since the loop started, plus anything not yet committed.
-        for rng in ((f"{base_sha}..HEAD",), ("HEAD",)):
-            d = git(repo, "diff", *rng)
-            if d.strip():
-                parts.append(d)
-    else:
-        d = git(repo, "diff")
+# Files whose diffs cost a great deal of context and tell a reviewer nothing
+# they can act on. A single lockfile change can be tens of thousands of tokens
+# of pure noise, multiplied by every reviewer on every round.
+NOISE_PATHSPECS = [
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "Cargo.lock", "poetry.lock", "Gemfile.lock", "composer.lock", "go.sum",
+    "*.min.js", "*.min.css", "*.map", "*.snap",
+    "dist/*", "build/*", "out/*", "vendor/*", "node_modules/*", ".next/*",
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf", "*.woff", "*.woff2",
+    "*.mp4", "*.zip", "*.parquet",
+    "*_pb2.py", "*.pb.go", "*.generated.*", "__snapshots__/*",
+]
+
+
+def _exclude_args(config: dict[str, Any]) -> list[str]:
+    specs = NOISE_PATHSPECS if config.get("exclude_noise", True) else []
+    specs = list(specs) + list(config.get("exclude_paths") or [])
+    return [f":(exclude,glob){s}" for s in specs] + [f":(exclude){STATE_DIRNAME}/*"]
+
+
+def _split_by_file(diff: str) -> list[tuple[str, str]]:
+    """Split a unified diff into (path, hunk-text) pairs."""
+    out: list[tuple[str, str]] = []
+    current: list[str] = []
+    path = ""
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                out.append((path, "".join(current)))
+            current = [line]
+            bits = line.split(" b/", 1)
+            path = bits[1].strip() if len(bits) > 1 else "?"
+        else:
+            current.append(line)
+    if current:
+        out.append((path, "".join(current)))
+    return out
+
+
+def collect_diff(repo: Path, base_sha: str | None,
+                 config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Build the review payload and report what it cost.
+
+    Returns the diff text plus a manifest describing anything excluded or
+    truncated, so a reviewer is never silently shown a partial picture.
+    """
+    excl = _exclude_args(config)
+    parts: list[str] = []
+    ranges = [(f"{base_sha}..HEAD",), ("HEAD",)] if base_sha else [()]
+    for rng in ranges:
+        d = git(repo, "diff", *rng, "--", ".", *excl)
         if d.strip():
             parts.append(d)
 
-    untracked = [f for f in git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
+    untracked = [f for f in git(repo, "ls-files", "--others", "--exclude-standard",
+                                "--", ".", *excl).splitlines()
                  if f.strip() and not f.startswith(STATE_DIRNAME)]
-    for path in untracked[:50]:
+
+    per_file = int(config.get("max_file_chars", 20000))
+    manifest: dict[str, Any] = {"truncated_files": [], "skipped_files": [],
+                                "untracked_files": len(untracked)}
+
+    files = _split_by_file("".join(parts))
+    kept: list[str] = []
+    for path, body in files:
+        if len(body) > per_file:
+            manifest["truncated_files"].append({"path": path, "chars": len(body)})
+            body = body[:per_file] + f"\n... [{path} truncated at {per_file} chars]"
+        # A diff whose final line has no newline would otherwise run into
+        # whatever section follows it.
+        kept.append(body if body.endswith("\n") else body + "\n")
+
+    for path in untracked[:60]:
         full = repo / path
         try:
-            if full.stat().st_size > 200_000:
-                parts.append(f"--- new file (too large to inline): {path} ---")
+            size = full.stat().st_size
+            if size > per_file:
+                manifest["skipped_files"].append({"path": path, "chars": size})
+                kept.append(f"--- new file, too large to inline: {path} ({size} bytes) ---\n")
                 continue
             body = full.read_text(errors="replace")
         except (OSError, UnicodeDecodeError):
-            parts.append(f"--- new binary file: {path} ---")
+            manifest["skipped_files"].append({"path": path, "chars": 0})
+            kept.append(f"--- new binary file: {path} ---\n")
             continue
-        parts.append(f"--- new file: {path} ---\n{body}")
-    return "\n".join(parts)
+        kept.append(f"--- new file: {path} ---\n{body}\n")
+
+    diff = "".join(kept)
+
+    # Whole-payload ceiling, applied last so per-file trimming does the work.
+    max_total = int(config.get("max_diff_chars", 120000))
+    if len(diff) > max_total:
+        diff = diff[:max_total] + f"\n\n[diff truncated at {max_total} chars]\n"
+        manifest["payload_truncated"] = True
+
+    manifest["chars"] = len(diff)
+    manifest["approx_tokens"] = len(diff) // 4
+    manifest["files"] = len(files) + len(untracked)
+    return diff, manifest
+
+
+def diff_note(manifest: dict[str, Any], config: dict[str, Any]) -> str:
+    """Tell the reviewer exactly what it is not being shown."""
+    lines = []
+    if config.get("exclude_noise", True):
+        lines.append("Lockfiles, build output, binary assets and generated code are "
+                     "excluded from this diff. Do not report on them.")
+    for item in manifest.get("truncated_files", [])[:10]:
+        lines.append(f"NOTE: {item['path']} was truncated; inspect it directly if relevant.")
+    for item in manifest.get("skipped_files", [])[:10]:
+        lines.append(f"NOTE: {item['path']} was not inlined; read it from the repository.")
+    if manifest.get("payload_truncated"):
+        lines.append("NOTE: the diff exceeded the payload budget and was cut. "
+                     "Use git to inspect anything missing.")
+    return "\n".join(lines)
 
 
 def run_validation(run: Run) -> tuple[bool, list[dict[str, Any]]]:
@@ -783,28 +902,32 @@ Finish with a short summary: which findings you fixed, and which you rejected
 and why.
 """
 
+# Ordered stable-content-first so that the persona, instructions, schema and
+# task form a cacheable prefix that does not change between rounds. Only the
+# diff and validation results vary, and they come last.
 REVIEW_PROMPT = """\
 {persona}
 
 Do NOT modify the repository. You have read-only access. Review only.
 
+Review the implementation from scratch. Do not assume previous review rounds
+were correct or complete, and look for regressions introduced by recent fixes.
+
+Inspect the surrounding code in the repository rather than reviewing the diff
+in isolation, but do not re-read files the diff already shows you in full.
+
+{shape}
+
 <task>
 {task}
 </task>
 
-The implementation below is the change under review. Inspect the surrounding
-code in the repository rather than reviewing this diff in isolation.
+{diff_note}
+{validation_note}
 
 <diff>
 {diff}
 </diff>
-
-{validation_note}
-
-Review the implementation from scratch. Do not assume previous review rounds
-were correct or complete, and look for regressions introduced by recent fixes.
-
-{shape}
 """
 
 # Shared by the review prompt and the repair prompt. The repair runs as a fresh
@@ -919,6 +1042,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     all_findings: list[dict[str, Any]] = []
     rounds_run = 0
     last_val_ok = False
+    previous_diff = ""
+    previous_signature: set[str] = set()
 
     for iteration in range(1, max_iter + 1):
         if run.should_stop():
@@ -933,22 +1058,38 @@ def cmd_run(args: argparse.Namespace) -> int:
         last_val_ok = val_ok
         (run_dir / f"validation-{iteration:02d}.json").write_text(json.dumps(val_results, indent=2))
 
-        diff = current_diff(repo, base_sha)
+        diff, manifest = collect_diff(repo, base_sha, config)
         if not diff.strip():
             run.emit("warning", message="Diff is empty; implementer may not have changed anything.")
+        run.emit("diff_ready", iteration=iteration, **{
+            k: v for k, v in manifest.items() if k in ("chars", "approx_tokens", "files")})
 
-        max_diff = int(config.get("max_diff_chars", 180000))
-        if len(diff) > max_diff:
-            diff = diff[:max_diff] + f"\n\n[diff truncated at {max_diff} chars]"
+        # The same payload goes to every reviewer, so its size is multiplied by
+        # the size of the panel. Report it once so the cost is visible.
+        if manifest.get("truncated_files") or manifest.get("skipped_files"):
+            run.emit("diff_trimmed", iteration=iteration,
+                     truncated=[t["path"] for t in manifest["truncated_files"]][:10],
+                     skipped=[t["path"] for t in manifest["skipped_files"]][:10])
 
-        validation_note = _validation_note(val_ok, val_results)
+        # If a fix round changed nothing, re-reviewing an identical payload
+        # would cost a full panel and return the same answer.
+        if iteration > 1 and diff == previous_diff:
+            run.emit("warning", message="Fix round produced no change to the diff; "
+                                        "stopping rather than re-reviewing identical code.")
+            outcome = "no_progress"
+            break
+        previous_diff = diff
+
+        # Reviewers get the verdict; the implementer gets the stack traces.
+        validation_note = _validation_note(val_ok, val_results, brief=True)
+        implementer_validation_note = _validation_note(val_ok, val_results)
 
         # --- reviewers, in parallel, read-only, no shared context ----------
         def do_review(rv: dict[str, Any]) -> tuple[dict[str, Any], bool, str]:
             prompt = REVIEW_PROMPT.format(
                 persona=load_persona(rv["persona"]),
                 task=task, diff=diff, validation_note=validation_note,
-                shape=OUTPUT_SHAPE,
+                diff_note=diff_note(manifest, config), shape=OUTPUT_SHAPE,
             )
             ok_, text_ = invoke_agent(
                 run, rv, prompt, readonly=True,
@@ -1010,9 +1151,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             outcome = "max_iterations_reached"
             break
 
+        # If the panel returns the same blocking findings it returned last
+        # round, the implementer is not converging. Another round costs a full
+        # panel plus a fix and will almost certainly return the same answer.
+        signature = {f"{f['file']}:{f['severity']}:{f['problem'][:80]}" for f in blockers}
+        if signature and signature == previous_signature:
+            run.emit("warning", message="The same blocking findings survived a fix round; "
+                                        "stopping rather than looping on them.")
+            outcome = "no_progress"
+            break
+        previous_signature = signature
+
         payload = json.dumps(blockers or merged, indent=2)
         if not val_ok:
-            payload += "\n\nVALIDATION FAILURES:\n" + validation_note
+            payload += "\n\nVALIDATION FAILURES:\n" + implementer_validation_note
         ok, text = invoke_agent(run, config["implementer"],
                                 FIX_PROMPT.format(task=task, count=len(reviewers),
                                                   reviews=payload),
@@ -1033,14 +1185,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome == "approved" else 2
 
 
-def _validation_note(ok: bool, results: list[dict[str, Any]]) -> str:
+def _validation_note(ok: bool, results: list[dict[str, Any]], brief: bool = False) -> str:
+    """Summarise validation.
+
+    `brief` is for reviewers, who need to know whether the suite passes but
+    cannot act on a stack trace — and who each pay for it separately, every
+    round. The implementer gets the full output because it has to fix it.
+    """
     if not results:
         return "No validation commands were configured for this run."
     lines = ["Validation results (these are ground truth, not opinion):"]
     for r in results:
         lines.append(f"  {'PASS' if r['passed'] else 'FAIL'}  {r['command']}")
-        if not r["passed"]:
+        if not r["passed"] and not brief:
             lines.append(textwrap.indent(r["output_tail"][-1500:], "      "))
+    if brief and not ok:
+        lines.append("  (failure output withheld; the build agent has it.)")
     return "\n".join(lines)
 
 
@@ -1058,6 +1218,9 @@ OUTCOME_NOTE = {
     "stopped_by_user": "Stopped on request. The working tree holds whatever the last "
                        "completed step produced.",
     "implementer_failed": "The build agent could not complete a fix round. See logs/.",
+    "no_progress": "A fix round changed nothing the reviewers cared about, so the loop "
+                   "stopped rather than spending another panel on the same answer. "
+                   "The findings below need a human.",
 }
 
 
@@ -1206,6 +1369,24 @@ def cmd_status(args: argparse.Namespace) -> int:
 SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 
 
+def _spend(events: list[dict[str, Any]]) -> str:
+    """Total reported token use and cost across every agent invocation."""
+    cost = sum(e.get("cost_usd", 0) or 0 for e in events if e.get("event") == "agent_done")
+    fresh = sum(e.get("tok_in", 0) or 0 for e in events if e.get("event") == "agent_done")
+    cached = sum(e.get("tok_cache_read", 0) or 0 for e in events if e.get("event") == "agent_done")
+    outp = sum(e.get("tok_out", 0) or 0 for e in events if e.get("event") == "agent_done")
+    if not (cost or fresh or cached or outp):
+        return ""
+    bits = []
+    if fresh or cached:
+        bits.append(f"{fresh + cached:,} in ({cached:,} cached)")
+    if outp:
+        bits.append(f"{outp:,} out")
+    if cost:
+        bits.append(f"${cost:.2f}")
+    return "spend: " + " · ".join(bits)
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     """Turn the event stream into the progress tree.
 
@@ -1227,6 +1408,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     out: list[str] = []
     agents: dict[str, dict[str, Any]] = {}
     round_open = False
+    panel_size = 1
 
     def plural(n: Any, word: str) -> str:
         return f"{n} {word}" if n == 1 else f"{n} {word}s"
@@ -1239,6 +1421,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     for e in events:
         ev = e.get("event")
         if ev == "run_start":
+            panel_size = max(1, len(e.get("reviewers") or []))
             revs = ", ".join(e.get("reviewers") or [])
             out.append(f"review-loop · {plural(len(e.get('reviewers') or []), 'reviewer')} "
                        f"· max {plural(e.get('max_iterations'), 'round')}")
@@ -1292,6 +1475,19 @@ def cmd_render(args: argparse.Namespace) -> int:
             round_open = False
         elif ev == "warning":
             out.append(f"  ⚠ {e.get('message')}")
+        elif ev == "diff_ready":
+            tok = e.get("approx_tokens") or 0
+            line = f"  · diff: {e.get('files')} files, ~{tok:,} tokens"
+            if panel_size > 1:
+                # The payload is sent to every reviewer, so this is the number
+                # that actually determines the round's cost.
+                line += f" × {panel_size} reviewers ≈ {tok * panel_size:,}/round"
+            out.append(line)
+        elif ev == "diff_trimmed":
+            for p in (e.get("truncated") or [])[:3]:
+                out.append(f"  · trimmed {p}")
+            for p in (e.get("skipped") or [])[:3]:
+                out.append(f"  · not inlined {p}")
         elif ev == "run_complete":
             out.append("")
             out.append("━" * 52)
@@ -1301,6 +1497,9 @@ def cmd_render(args: argparse.Namespace) -> int:
                        f"{plural(e.get('findings'), 'finding')} · "
                        f"{e.get('blocking_open')} blocking open · "
                        f"validation {'passing' if e.get('validation_passed') else 'FAILING'}")
+            spend = _spend(events)
+            if spend:
+                out.append(f"  {spend}")
             out.append(f"  report: {e.get('final')}")
             out.append("━" * 52)
 

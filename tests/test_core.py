@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "revi
 
 from review_loop import (  # noqa: E402
     STATE_DIRNAME, Run, dedupe, extract_json, normalise_findings, validate_config,
-    _keyword_hit, _signal_hit, _write_final,
+    _keyword_hit, _signal_hit, _write_final, collect_diff, base_commit, diff_note,
 )
 
 
@@ -184,7 +184,7 @@ class ValidateConfig(unittest.TestCase):
     def test_label_defaults_from_persona(self):
         cfg = self.base()
         validate_config(cfg)
-        self.assertEqual(cfg["reviewers"][0]["label"], "Security")
+        self.assertEqual(cfg["reviewers"][0]["label"], "Security Engineer")
 
 
 class PanelRouting(unittest.TestCase):
@@ -219,6 +219,71 @@ class PanelRouting(unittest.TestCase):
 
     def test_empty_signal_never_matches(self):
         self.assertFalse(_signal_hit("", ["a/b/c.py"]))
+
+
+class DiffCollection(unittest.TestCase):
+    """The diff is sent to every reviewer on every round, so its size is
+    multiplied by panel size and round count. Excluding the wrong thing is
+    worse than the waste, so both directions are checked."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self._git("init")
+        self._git("config", "user.email", "t@t.co")
+        self._git("config", "user.name", "T")
+        (self.repo / "app.py").write_text("print(1)\n")
+        (self.repo / "package-lock.json").write_text("{}\n")
+        (self.repo / "dist").mkdir()
+        (self.repo / "dist" / "bundle.js").write_text("x\n")
+        self._git("add", "-A")
+        self._git("commit", "-m", "init")
+
+    def _git(self, *args):
+        import subprocess
+        subprocess.run(["git", *args], cwd=self.repo, capture_output=True)
+
+    def test_real_changes_survive_and_noise_is_dropped(self):
+        (self.repo / "app.py").write_text("def add(a, b):\n    return a + b\n")
+        (self.repo / "package-lock.json").write_text('{"deps": %s}\n' % ("x" * 40000))
+        (self.repo / "dist" / "bundle.js").write_text("var x=1;" * 3000)
+
+        diff, man = collect_diff(self.repo, base_commit(self.repo), {})
+        self.assertIn("def add(a, b)", diff)          # the change under review
+        self.assertNotIn("package-lock", diff)        # lockfile noise
+        self.assertNotIn("bundle.js", diff)           # build output
+        self.assertLess(man["chars"], 2000)
+
+    def test_exclusions_can_be_turned_off(self):
+        (self.repo / "package-lock.json").write_text('{"deps": %s}\n' % ("x" * 5000))
+        diff, _ = collect_diff(self.repo, base_commit(self.repo), {"exclude_noise": False})
+        self.assertIn("package-lock", diff)
+
+    def test_large_file_is_truncated_not_dropped(self):
+        (self.repo / "app.py").write_text("# line\n" * 20000)
+        diff, man = collect_diff(self.repo, base_commit(self.repo), {"max_file_chars": 5000})
+        self.assertTrue(man["truncated_files"])
+        self.assertIn("truncated at 5000", diff)
+        # The reviewer must be told, or it reviews a partial picture unknowingly.
+        self.assertIn("app.py", diff_note(man, {}))
+
+    def test_sections_are_newline_separated(self):
+        (self.repo / "app.py").write_text("x = 1")   # no trailing newline
+        (self.repo / "new.py").write_text("y = 2\n")
+        diff, _ = collect_diff(self.repo, base_commit(self.repo), {})
+        self.assertNotIn("x = 1---", diff)
+
+    def test_custom_exclusions_are_honoured(self):
+        (self.repo / "app.py").write_text("changed\n")
+        diff, _ = collect_diff(self.repo, base_commit(self.repo),
+                               {"exclude_paths": ["app.py"]})
+        self.assertNotIn("changed", diff)
+
+    def test_state_directory_is_never_reviewed(self):
+        state = self.repo / STATE_DIRNAME
+        state.mkdir()
+        (state / "task.md").write_text("the task\n")
+        diff, _ = collect_diff(self.repo, base_commit(self.repo), {})
+        self.assertNotIn("the task", diff)
 
 
 class WriteFinal(unittest.TestCase):

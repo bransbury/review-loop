@@ -192,6 +192,50 @@ agent because a reviewer wanted a variable renamed.
 **Findings raised independently by two reviewers are marked
 `corroborated_by`** and treated as high-confidence.
 
+## Token efficiency
+
+A panel multiplies cost: the diff goes to every reviewer, every round. Three
+reviewers over five rounds is fifteen copies. The design takes that seriously.
+
+**Noise never reaches a reviewer.** Lockfiles, `dist/`, minified bundles,
+snapshots, binary assets and generated code are excluded by default. On a
+change that also touched `package-lock.json`, this took the review payload from
+~10,000 tokens to ~570 — a 94% cut, with the actual code change untouched.
+Reviewers are told what was withheld so they never review a partial picture
+believing it complete.
+
+**Stable content comes first.** The persona, instructions, schema and task form
+a cacheable prefix; only the diff and validation results vary. In a measured
+run, 545,248 of 545,361 input tokens were cache reads.
+
+**The panel is capped and the loop exits early.** `suggest` recommends at most
+four reviewers. The loop stops when a fix round changes nothing, and when the
+same blocking findings survive a round — spending another full panel to receive
+the same answer is the most expensive way to learn nothing.
+
+**Reviewers get the verdict, not the stack trace.** Failing test output goes to
+the build agent, which has to fix it, and not to every reviewer, which cannot.
+
+**Spend is reported, not guessed.** Where the CLI returns real usage, `render`
+shows it:
+
+```
+spend: 545,361 in (545,248 cached) · 14,637 out · $0.52
+```
+
+Worth knowing: most of that is per-invocation harness overhead, not your diff.
+The strongest lever is therefore fewer invocations — a smaller panel and fewer
+rounds — not a smaller prompt.
+
+Tunable in the run config:
+
+| Key | Default | Effect |
+|---|---|---|
+| `exclude_noise` | `true` | Drop lockfiles, build output, binaries, generated code |
+| `exclude_paths` | `[]` | Extra glob pathspecs to exclude |
+| `max_file_chars` | `20000` | Per-file cap before truncation |
+| `max_diff_chars` | `120000` | Whole-payload ceiling |
+
 ## Configuration
 
 Save defaults to `~/.review-loop/defaults.json` so you are not re-answering the

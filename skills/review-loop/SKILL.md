@@ -34,7 +34,14 @@ You are the wizard and the renderer. The script is the orchestrator. Do not reim
 
 ## Token discipline
 
-Be concise. Do not paste the diff, the prompts, or the raw JSON into the conversation. Report progress as the compact tree shown below. Summarise findings; the full detail is on disk.
+Be concise. Do not paste the diff, the prompts, or the raw JSON into the conversation. Use `render` for progress. Summarise findings; the full detail is on disk.
+
+The orchestrator is where the real spend happens, and a panel multiplies it — the diff goes to every reviewer, every round. So:
+
+- **Recommend the smallest panel that covers the task.** Two or three reviewers. Every extra reviewer is a whole extra agent invocation per round, and per-invocation overhead dominates the diff itself.
+- **Do not raise `max_iterations` above 5** unless asked. Rounds are the most expensive unit in the system.
+- **Do not disable `exclude_noise`** unless the user is specifically reviewing a lockfile or generated output.
+- **Never re-read files to summarise them yourself.** The reviewers already have the diff; reading it again into your own context buys nothing.
 
 ## 1. Preflight
 
@@ -167,7 +174,7 @@ When `run_complete` appears, read `final.md` from the run directory and report:
 
 Then show the user the diff summary and hand off. Do not commit or push unless asked.
 
-**If the outcome is `max_iterations_reached`, say so plainly and stop.** That means the panel and the implementer did not converge, and it needs a human. Do not raise the cap and try again without being asked.
+**If the outcome is `max_iterations_reached` or `no_progress`, say so plainly and stop.** Both mean the panel and the implementer did not converge, and it needs a human. `no_progress` specifically means a fix round changed nothing the reviewers cared about — re-running would cost another full panel to receive the same answer. Do not raise the cap or restart without being asked.
 
 ## Severity policy
 
