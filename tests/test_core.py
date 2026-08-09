@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "review-loop" / "scripts"))
 
@@ -154,6 +155,15 @@ class Dedupe(unittest.TestCase):
 class ValidateConfig(unittest.TestCase):
     """Config errors must surface before launch, not as a silent clean review."""
 
+    def setUp(self):
+        # Config-shape tests must not depend on which agent CLIs happen to be
+        # installed on the machine running the suite. PATH validation has its
+        # own explicit test below.
+        cli_lookup = patch("review_loop.shutil.which",
+                           side_effect=lambda binary: f"/usr/bin/{binary}")
+        cli_lookup.start()
+        self.addCleanup(cli_lookup.stop)
+
     def base(self, **over):
         cfg = {"task": "do a thing",
                "validation": {"commands": ["true"]},
@@ -164,6 +174,12 @@ class ValidateConfig(unittest.TestCase):
 
     def test_valid_config_passes(self):
         self.assertEqual(validate_config(self.base()), [])
+
+    def test_configured_cli_must_be_on_path(self):
+        with patch("review_loop.shutil.which", return_value=None):
+            errors = validate_config(self.base())
+        self.assertTrue(any("`claude` is configured but not on PATH" in error
+                            for error in errors))
 
     def test_no_reviewers_is_rejected(self):
         # Otherwise the loop finds zero blockers and reports "approved".
