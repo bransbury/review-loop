@@ -1,6 +1,6 @@
 ---
 name: review-loop
-version: 0.1.0
+version: 0.2.0
 description: "Implement a task with a build agent, then have a configurable panel of adversarial reviewer personas review it in parallel, fix the findings, and re-review from scratch until tests pass and no blocking findings remain."
 ---
 
@@ -25,12 +25,14 @@ You are the wizard and the renderer. The script is the orchestrator. Do not reim
 ## Hard rules
 
 - **Never skip the wizard on the first run in a repository.** Model and reviewer choice is the whole product. Defaults are a convenience, not an assumption.
-- **Reviewers are read-only, enforced by CLI flags** (`--permission-mode plan`, `--deny-tool write`, `-s read-only`), not by asking politely in a prompt.
+- **Reviewers are read-only, enforced by CLI flags** (`--permission-mode plan`, `--deny-tool write --deny-tool shell`, `-s read-only`), not by asking politely in a prompt. Copilot's `write` permission explicitly does not cover shell invocations, so its shell is denied outright rather than command by command.
 - **Reviewers never see the implementer's reasoning or self-assessment.** They get the task, the repository, and the diff. Nothing else.
 - **Every review round starts from scratch.** Never ask "did the implementer fix ARCH-001?". Anchoring on prior findings hides regressions introduced by the fixes.
 - **Tests are an independent gate.** Agreement between models is not a definition of correctness. If validation fails, the loop keeps going even when every reviewer approves.
+- **A missing answer is never a clean one.** A review counts only if it parses *and* is structurally a review — explicit verdict, `findings` list, objects inside it. If any reviewer fails that, the round is incomplete and the run cannot be approved, no matter how quiet the rest of the panel was.
+- **A gate that never ran did not pass.** A run with no validation commands is rejected at launch; approving without one takes an explicit `allow_missing_validation`, and reports as `approved_unverified`.
 - **One harness by default.** Every slot uses the CLI you were invoked from unless the user explicitly opts into mixing.
-- **Never run this on a dirty working tree** without telling the user. Uncommitted work will be mixed into the diff under review and may be modified by the implementer.
+- **Never run this on a dirty working tree** without telling the user. Uncommitted work will be mixed into the diff under review and may be modified by the implementer. The script refuses to start on a dirty or non-git tree unless the config says `allow_dirty` / `allow_non_git`, and it holds a lock so only one run at a time can touch a worktree.
 
 ## Token discipline
 
@@ -53,11 +55,11 @@ python3 <skill-dir>/scripts/review_loop.py detect
 
 It returns installed CLIs, their available models and effort ladders, the persona library, and a guess at which harness invoked you. Model availability varies by plan and by org policy — never hardcode a model list, always use what `detect` reports.
 
-Then check the repository state:
+Then check the repository state. The script enforces all of this itself and will refuse to launch, but checking here lets you explain the problem instead of relaying an error:
 
 - Confirm you are in a git repository. If not, stop and say so.
-- Check `git status`. If the tree is dirty, tell the user what is uncommitted and ask whether to continue, commit first, or stop.
-- Identify validation commands from the project itself — `package.json` scripts, `Makefile`, `pyproject.toml`, CI config. Propose what you find; do not invent commands that do not exist.
+- Check `git status`. If the tree is dirty, tell the user what is uncommitted and ask whether to continue, commit first, or stop. Only set `allow_dirty` if they choose to continue.
+- Identify validation commands from the project itself — `package.json` scripts, `Makefile`, `pyproject.toml`, CI config. Propose what you find; do not invent commands that do not exist. If the project genuinely has none, say plainly that the run will have no independent gate and that its result is model consensus only, then set `allow_missing_validation`.
 
 If no task was supplied with the invocation, ask for one before anything else.
 
@@ -113,6 +115,7 @@ Config shape:
   "parallel": true,
   "permission_mode": "acceptEdits",
   "validation": { "commands": ["npm test", "npm run lint", "npm run typecheck"] },
+  "require_clean_baseline": false,
   "implementer": { "cli": "claude", "model": "opus", "effort": "high" },
   "reviewers": [
     { "persona": "principal-engineer", "label": "Principal Engineer",
@@ -123,7 +126,19 @@ Config shape:
 }
 ```
 
-`start` returns a run directory and exits immediately. It also adds `.review-loop/` to the repository's `.gitignore`.
+`start` returns a run directory and exits immediately. It keeps `.review-loop/` out of git by writing a `.gitignore` inside that directory, so it never modifies a file the user tracks.
+
+Safety escape hatches, all off by default. Only set one because the user chose it, and say which you set:
+
+| Key | Effect |
+|---|---|
+| `allow_dirty` | Start on a working tree with uncommitted changes. |
+| `allow_non_git` | Start somewhere that is not a git working tree. Nothing the build agent does will be reviewable or reversible. |
+| `allow_missing_validation` | Allow approval with no validation commands. The outcome becomes `approved_unverified`. |
+| `require_clean_baseline` | Abort if validation is already failing before the task starts, instead of recording it and continuing. |
+| `max_untracked_files` | How many new files are inlined into the diff (default 60). The rest are listed by path so reviewers know to read them. |
+
+Before the build agent runs, the loop records a **baseline** validation result in `validation-00.json`. If the suite was already failing, that is reported to the implementer, to the reviewers, and in `final.md`, so a later failure is never misattributed to the change under review.
 
 Each reviewer slot accepts an optional `config_dir`, which sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that agent. Use it only if the user has a second authenticated account and asks for it — it spreads rate limits across subscriptions. It is off by default.
 
@@ -160,21 +175,34 @@ Between polls, tell the user they can keep working and that `status` and `stop` 
 Two events need surfacing immediately rather than at the end:
 
 - **`permission_denied`** — the build agent was blocked from running commands, so its "success" is unverified. Tell the user at once and offer to stop and restart with full permissions.
-- **`review_unparsed`** — a reviewer failed to return usable JSON twice. Its findings are missing from the round, so the panel is smaller than the user thinks. Say so rather than reporting a clean review.
+- **`review_unparsed`** — a reviewer contributed nothing usable: it failed, returned output that would not parse or that was not a well-formed review (no verdict, a `findings` value that is not a list of objects), or requested changes without naming a single finding. The `reason` field says which. Its findings are missing from the round, so the panel is smaller than the user thinks. Say so rather than reporting a clean review. The loop will not approve a round in this state; it ends as `review_incomplete`.
 
 ## 5. Finish
 
 When `run_complete` appears, read `final.md` from the run directory and report:
 
-- the outcome — approved, max iterations reached, stopped, or failed
-- rounds run, findings raised, findings resolved
-- validation status
-- any finding the implementer rejected, with its stated evidence
-- anything still outstanding
+- the outcome
+- rounds run, findings raised, findings resolved — `final.md` carries all of these, because the loop keeps a ledger of every finding across rounds rather than only the last round's list
+- validation status, including whether it was already failing before the task started
+- any finding the implementer rejected, with its stated evidence — those are in `implementer-NN.md`
+- anything still outstanding, including any finding marked as having come back after being fixed
 
 Then show the user the diff summary and hand off. Do not commit or push unless asked.
 
-**If the outcome is `max_iterations_reached` or `no_progress`, say so plainly and stop.** Both mean the panel and the implementer did not converge, and it needs a human. `no_progress` specifically means a fix round changed nothing the reviewers cared about — re-running would cost another full panel to receive the same answer. Do not raise the cap or restart without being asked.
+Outcomes and what to do about them:
+
+| Outcome | Exit | Meaning |
+|---|---|---|
+| `approved` | 0 | Every reviewer reported, nothing blocking is open, validation passed. |
+| `approved_unverified` | 0 | Same, but no validation commands existed. Model consensus only — say so. |
+| `review_incomplete` | 2 | A reviewer contributed nothing. Part of the change went unreviewed. Not an approval. |
+| `validation_not_configured` | 2 | Nothing blocking is open, but there was no gate and no explicit opt-in. |
+| `baseline_failed` | 1 | Validation was failing before the task started, with `require_clean_baseline` set. |
+| `max_iterations_reached` | 2 | Hit the cap with blocking findings open. |
+| `no_progress` | 2 | A fix round changed nothing the reviewers cared about. |
+| `implementer_failed` | 1 | The build agent could not complete a round. |
+
+**If the outcome is `max_iterations_reached`, `no_progress` or `review_incomplete`, say so plainly and stop.** The first two mean the panel and the implementer did not converge. `no_progress` specifically means a fix round changed nothing the reviewers cared about — re-running would cost another full panel to receive the same answer. `review_incomplete` means part of the change was never reviewed; offer to re-run that reviewer, and never describe the result as clean. Do not raise the cap or restart without being asked.
 
 ## Severity policy
 
@@ -192,14 +220,18 @@ Findings marked `corroborated_by` were raised independently by more than one rev
 
 ```text
 .review-loop/
+  .gitignore           makes this directory invisible to git
   task.md
   final.md
   current-run
+  lock                 one active run per worktree
   history/run-NN/
     config.json          resolved configuration
     progress.jsonl       event stream — poll this
-    findings-NN.json     merged, deduplicated
+    findings-NN.json     merged, deduplicated, this round only
+    ledger.json          every finding across all rounds, with its state
     review-NN-<persona>.json
+    validation-00.json   baseline, before the build agent ran
     validation-NN.json
     implementer-NN.md
     final.md
@@ -211,8 +243,10 @@ Findings marked `corroborated_by` were raised independently by more than one rev
 Stop and hand back to the user when:
 
 - the repository is not a git repository, or the tree is dirty and they have not chosen how to proceed
+- another run is already active in this worktree
 - `detect` finds no usable CLI
+- the project has no validation commands and the user has not accepted an unverified run
 - the implementer fails twice in a row
-- a reviewer returns unparseable output twice for the same round
+- a reviewer returns unparseable output twice for the same round — the run ends as `review_incomplete`, which is not an approval
 - the iteration cap is reached with blocking findings outstanding
-- validation was already failing before the loop started — fix that first, or the gate is meaningless
+- validation was already failing before the loop started — the loop records this as a baseline and continues, but say so; fix it first unless fixing it *is* the task
