@@ -44,7 +44,7 @@ class ReleaseFixture(unittest.TestCase):
 
 class ReleaseValidation(ReleaseFixture):
     def test_current_repository_metadata_is_consistent(self):
-        self.assertEqual("0.2.0", release.validate_release(REPO, "v0.2.0"))
+        self.assertEqual("0.3.0", release.validate_release(REPO, "v0.3.0"))
 
     def test_matching_metadata_and_tag_pass(self):
         self.assertEqual("0.2.0", release.validate_release(self.root, "v0.2.0"))
@@ -78,7 +78,7 @@ class ReleaseValidation(ReleaseFixture):
             capture_output=True,
             check=True,
         )
-        self.assertEqual("review_loop 0.2.0", result.stdout.strip())
+        self.assertEqual("review_loop 0.3.0", result.stdout.strip())
 
 
 class ReleaseChanges(ReleaseFixture):
