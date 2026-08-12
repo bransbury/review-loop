@@ -7,6 +7,47 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Credential-free fake-CLI end-to-end coverage for clean approval, validation
+  and reviewer-driven repair, reviewer failure, permission mappings, detached
+  completion, same-worktree locking, non-Git operation, snapshot invalidation,
+  and fail-closed Git errors.
+- Process-tree timeout tests and isolated installer integration tests across
+  copy, symlink, update, uninstall, spaces, and custom Claude config paths.
+
+### Changed
+
+- Make clean baseline validation the safe default; baseline-repair tasks must
+  explicitly set `require_clean_baseline: false`.
+- Canonicalize configured repository subdirectories to the actual Git
+  worktree root for state, locking, validation, diffs, and agent execution.
+- Move owned state and the live lock outside the worktree, authenticate explicit
+  run paths, and reject symlinked or unrecognized state objects.
+- Map `acceptEdits` and `bypassPermissions` truthfully for Claude, Copilot, and
+  Codex while preserving enforced read-only reviewer isolation.
+- Use Claude Code JSON Schema output when the installed CLI supports it, with
+  safe fallback for older versions.
+- Require a monotonic blocking-severity threshold and bound panel, command,
+  timeout, input, diff, and transcript sizes before launch.
+
+### Fixed
+
+- Fail closed on invalid runtime configuration, Git safety/diff failures,
+  nonzero agent exits, and unexpected orchestration exceptions while still
+  producing terminal events, a final report, and releasing the lock.
+- Terminate complete agent and validation process trees on timeout (including
+  descendants in new sessions that clear their environment), make forced stop
+  drain active trees before lock reclamation, and retain bounded partial
+  stdout/stderr for diagnosis.
+- Refuse to recursively replace or uninstall an unrecognized installer
+  destination; quarantine and revalidate exact destination-bound ownership
+  before deletion, and serialize concurrent installer operations.
+- Validate the complete fallback review schema and invalidate approval when the
+  worktree changes between validation/diff collection and reviewer completion.
+- Preserve partial run history and failure stage/detail in unexpected terminal
+  reports, and make stdout event echo best-effort after durable recording.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added

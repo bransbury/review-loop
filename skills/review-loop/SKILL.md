@@ -25,12 +25,13 @@ You are the wizard and the renderer. The script is the orchestrator. Do not reim
 ## Hard rules
 
 - **Never skip the wizard on the first run in a repository.** Model and reviewer choice is the whole product. Defaults are a convenience, not an assumption.
-- **Reviewers are read-only, enforced by CLI flags** (`--permission-mode plan`, `--deny-tool write --deny-tool shell`, `-s read-only`), not by asking politely in a prompt. Copilot's `write` permission explicitly does not cover shell invocations, so its shell is denied outright rather than command by command.
+- **Reviewers are read-only, enforced by CLI flags** (`--permission-mode plan --setting-sources ""`, explicit Copilot read-only approval plus write/shell/MCP denial, `-s read-only`), not by asking politely in a prompt. Permission-affecting Copilot environment variables are removed before launch, and Claude project settings/hooks are not loaded for reviewer sessions.
 - **Reviewers never see the implementer's reasoning or self-assessment.** They get the task, the repository, and the diff. Nothing else.
 - **Every review round starts from scratch.** Never ask "did the implementer fix ARCH-001?". Anchoring on prior findings hides regressions introduced by the fixes.
 - **Tests are an independent gate.** Agreement between models is not a definition of correctness. If validation fails, the loop keeps going even when every reviewer approves.
 - **A missing answer is never a clean one.** A review counts only if it parses *and* is structurally a review — explicit verdict, `findings` list, objects inside it. If any reviewer fails that, the round is incomplete and the run cannot be approved, no matter how quiet the rest of the panel was.
 - **A gate that never ran did not pass.** A run with no validation commands is rejected at launch; approving without one takes an explicit `allow_missing_validation`, and reports as `approved_unverified`.
+- **A failing baseline stops by default.** Do not silently expand the task to pre-existing failures. Only set `require_clean_baseline: false` when the user confirms that repairing the baseline is part of the task.
 - **One harness by default.** Every slot uses the CLI you were invoked from unless the user explicitly opts into mixing.
 - **Never run this on a dirty working tree** without telling the user. Uncommitted work will be mixed into the diff under review and may be modified by the implementer. The script refuses to start on a dirty or non-git tree unless the config says `allow_dirty` / `allow_non_git`, and it holds a lock so only one run at a time can touch a worktree.
 
@@ -87,10 +88,10 @@ The same persona may appear twice on different models — that is a legitimate w
 
 **Question 4 — Mixing (only if `detect` found more than one CLI).** Default is no. If the user opts in, re-ask question 3 with models from every detected CLI, labelled by which one they come from. Cross-family reviewers disagree more usefully than same-family ones, which is the main reason to bother.
 
-**Question 5 — Build agent permissions.** The build agent has to run tests unattended. Under the default `acceptEdits` it can edit files but shell commands are denied, so it will often report success having verified nothing. Offer:
+**Question 5 — Build agent permissions.** The build agent has to work unattended. Only `acceptEdits` and `bypassPermissions` are supported, and their exact effect is adapter-specific: Claude uses its native modes; Copilot's `acceptEdits` approves its local write permission but denies the shell and does not blanket-approve MCP tools, while its bypass maps to `--allow-all`; Codex maps them to `workspace-write` and `--dangerously-bypass-approvals-and-sandbox`. Offer:
 
 - **Full permissions (`bypassPermissions`)** — recommended, and strongly recommended *inside a git worktree or container* so an autonomous agent cannot touch anything you care about. Suggest `git worktree add ../<name>-review -b <branch>` and running there.
-- **Edits only (`acceptEdits`)** — safer, but the agent probably cannot run your test suite, which weakens the independent gate that makes this tool worth using.
+- **Bounded editing (`acceptEdits`)** — safer. Copilot cannot run shell tests in this mode; Codex can run them inside its workspace sandbox; Claude follows its native permission contract.
 
 Say which you are using and why. Do not silently pick the permissive one.
 
@@ -115,7 +116,7 @@ Config shape:
   "parallel": true,
   "permission_mode": "acceptEdits",
   "validation": { "commands": ["npm test", "npm run lint", "npm run typecheck"] },
-  "require_clean_baseline": false,
+  "require_clean_baseline": true,
   "implementer": { "cli": "claude", "model": "opus", "effort": "high" },
   "reviewers": [
     { "persona": "principal-engineer", "label": "Principal Engineer",
@@ -126,19 +127,19 @@ Config shape:
 }
 ```
 
-`start` returns a run directory and exits immediately. It keeps `.review-loop/` out of git by writing a `.gitignore` inside that directory, so it never modifies a file the user tracks.
+`start` returns a run directory and exits immediately. State and the live lock are stored outside the worktree: under Git's per-worktree administrative directory for Git runs, or under the private keyed `~/.review-loop/state/non-git/` root for explicit non-Git runs. This means repository files, symlinks, and `git clean` cannot overwrite history or remove the active lock.
 
-Safety escape hatches, all off by default. Only set one because the user chose it, and say which you set:
+Safety escape hatches are off by default. Clean-baseline enforcement is on by default. Only use an override because the user chose it, and say which you set:
 
 | Key | Effect |
 |---|---|
 | `allow_dirty` | Start on a working tree with uncommitted changes. |
 | `allow_non_git` | Start somewhere that is not a git working tree. Nothing the build agent does will be reviewable or reversible. |
 | `allow_missing_validation` | Allow approval with no validation commands. The outcome becomes `approved_unverified`. |
-| `require_clean_baseline` | Abort if validation is already failing before the task starts, instead of recording it and continuing. |
+| `require_clean_baseline: false` | Continue after a failing baseline only when repairing it is explicitly within task scope. |
 | `max_untracked_files` | How many new files are inlined into the diff (default 60). The rest are listed by path so reviewers know to read them. |
 
-Before the build agent runs, the loop records a **baseline** validation result in `validation-00.json`. If the suite was already failing, that is reported to the implementer, to the reviewers, and in `final.md`, so a later failure is never misattributed to the change under review.
+Before the build agent runs, the loop records a **baseline** validation result in `validation-00.json`. A failure ends as `baseline_failed` before the agent runs. With the explicit repair-task override, the failure is instead reported to the implementer, reviewers, and `final.md`.
 
 Each reviewer slot accepts an optional `config_dir`, which sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that agent. Use it only if the user has a second authenticated account and asks for it — it spreads rate limits across subscriptions. It is off by default.
 
@@ -197,10 +198,11 @@ Outcomes and what to do about them:
 | `approved_unverified` | 0 | Same, but no validation commands existed. Model consensus only — say so. |
 | `review_incomplete` | 2 | A reviewer contributed nothing. Part of the change went unreviewed. Not an approval. |
 | `validation_not_configured` | 2 | Nothing blocking is open, but there was no gate and no explicit opt-in. |
-| `baseline_failed` | 1 | Validation was failing before the task started, with `require_clean_baseline` set. |
+| `baseline_failed` | 1 | Validation was failing before the task started; clean baseline is the default. |
 | `max_iterations_reached` | 2 | Hit the cap with blocking findings open. |
 | `no_progress` | 2 | A fix round changed nothing the reviewers cared about. |
 | `implementer_failed` | 1 | The build agent could not complete a round. |
+| `run_failed` | 1 | A safety-critical Git operation or unexpected orchestration step failed; terminal state and report were still written. |
 
 **If the outcome is `max_iterations_reached`, `no_progress` or `review_incomplete`, say so plainly and stop.** The first two mean the panel and the implementer did not converge. `no_progress` specifically means a fix round changed nothing the reviewers cared about — re-running would cost another full panel to receive the same answer. `review_incomplete` means part of the change was never reviewed; offer to re-run that reviewer, and never describe the result as clean. Do not raise the cap or restart without being asked.
 
@@ -219,8 +221,8 @@ Findings marked `corroborated_by` were raised independently by more than one rev
 ## Files it writes
 
 ```text
-.review-loop/
-  .gitignore           makes this directory invisible to git
+<git-admin-dir>/review-loop/       # ~/.review-loop/state/non-git/<key>/ without Git
+  .owner               validated state ownership marker
   task.md
   final.md
   current-run
@@ -235,7 +237,7 @@ Findings marked `corroborated_by` were raised independently by more than one rev
     validation-NN.json
     implementer-NN.md
     final.md
-    logs/                full transcript per agent invocation
+    logs/                bounded transcript per agent invocation
 ```
 
 ## Stop conditions
@@ -249,4 +251,4 @@ Stop and hand back to the user when:
 - the implementer fails twice in a row
 - a reviewer returns unparseable output twice for the same round — the run ends as `review_incomplete`, which is not an approval
 - the iteration cap is reached with blocking findings outstanding
-- validation was already failing before the loop started — the loop records this as a baseline and continues, but say so; fix it first unless fixing it *is* the task
+- validation was already failing before the loop started — stop on `baseline_failed`; only configure `require_clean_baseline: false` for a task whose stated purpose includes fixing it

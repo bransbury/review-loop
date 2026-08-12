@@ -22,6 +22,7 @@ backward-compatible fixes.
    ```bash
    python3 -m unittest discover -s tests -v
    python3 scripts/release.py check
+   python3 -m compileall -q skills scripts tests
    bash -n install.sh
    ```
 
@@ -54,8 +55,12 @@ archives.
 1. Confirm the Release workflow completed successfully.
 2. Check the GitHub Release notes and source archives.
 3. Test one clean plugin installation and update the installation if the
-   release changes distribution behavior.
-4. Announce breaking changes and migrations prominently.
+   release changes distribution behavior. For installer changes, exercise both
+   symlink and copy updates and confirm an unknown destination is refused.
+4. For adapter compatibility changes, compare contract tests with the current
+   Claude, Codex, and Copilot help output. For process changes, confirm the CI
+   matrix covers supported macOS and Linux runners.
+5. Announce breaking changes and migrations prominently.
 
 Published tags are immutable. Never move or reuse a version tag. If a release
 is faulty, fix it on `main` and publish a new patch release.

@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "_comment": "Every property is listed in `required` because OpenAI-style structured output rejects strict schemas with optional keys. Fields that may be absent use a nullable type instead.",
+        "$comment": "Every property is listed in required because strict structured output rejects schemas with optional keys. Fields that may be absent use a nullable type instead.",
         "required": ["id", "severity", "file", "line", "category", "problem", "impact", "recommended_fix"],
         "properties": {
           "id": {

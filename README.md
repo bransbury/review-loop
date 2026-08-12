@@ -66,7 +66,10 @@ cd review-loop && ./install.sh
 ```
 
 Symlinks by default, so `git pull` updates every harness at once. Use
-`--copy` for independent copies, `--uninstall` to remove.
+`--copy` for independent copies, `--uninstall` to remove. Re-running the
+installer safely updates installations it recognizes. If a destination named
+`review-loop` already exists but is not a review-loop installation, the
+installer stops without deleting or replacing it.
 
 ## Update
 
@@ -211,11 +214,11 @@ reviewer on the previous round and hides regressions introduced by the fixes.
 definition of correctness. Validation commands run every round, and failing
 tests keep the loop alive even when every reviewer approves.
 
-**Reviewers are read-only, enforced by flags.** `--permission-mode plan`,
-`--deny-tool write --deny-tool shell`, `-s read-only` — not a polite request in
-a prompt. Copilot's `write` permission covers file-writing tools but explicitly
-not shell invocations, so its shell is denied outright; denying `git commit` and
-`git push` by name would still have left `sed -i`, `rm` and redirection.
+**Reviewers are read-only, enforced by flags and trusted configuration.** Claude
+uses plan mode with project/local setting sources disabled, Copilot explicitly
+allows its read capability while denying write, shell, and MCP tools, and Codex
+uses `-s read-only`. Permission-affecting Copilot environment approvals are
+removed before launch. This is not merely a prompt instruction.
 
 **A missing answer is not a clean one.** A review counts only if it parses
 *and* holds a real review: an explicit verdict, a `findings` list, objects
@@ -231,14 +234,32 @@ resolve findings in the ledger either.
 `not_configured` — never a boolean that reads "true" when nothing executed. A
 config with no validation commands is rejected at launch; approving without one
 requires `allow_missing_validation` and reports as `approved_unverified`. A
-baseline run before the build agent starts records whether the suite was
-already failing, so a later failure is never misattributed to the change.
+baseline run before the build agent starts must pass by default, so pre-existing
+failures cannot silently expand the task. A task whose stated purpose includes
+repairing that baseline can explicitly set `require_clean_baseline` to `false`;
+the original failure is then carried into prompts and the final report.
 
 **One run per worktree, and never on a tree it cannot reason about.** The
 orchestrator refuses to start on a non-git or dirty working tree unless
-explicitly allowed, and holds an atomic lock so two runs cannot edit the same
-files and race on `current-run`. It keeps its own state out of git with a
-`.gitignore` inside `.review-loop/`, so it never modifies a tracked file.
+explicitly allowed. It resolves any configured subdirectory through Git to the
+canonical worktree root, then uses that root for agent cwd, validation, diffs,
+state and an atomic lock. Two subdirectory configs therefore cannot edit the
+same worktree concurrently or race on `current-run`. State and the lock live
+outside the worktree in Git's per-worktree administrative directory, where a
+tracked path, planted symlink, reviewer, or `git clean` cannot remove them.
+
+**Timeouts stop process trees.** Agent and validation commands run in their own
+POSIX process groups while a kernel-identity tracker records descendants that
+escape into a new session or clear their environment. On supported macOS and
+Linux hosts, a timeout terminates the complete recorded tree and preserves
+bounded partial stdout/stderr in logs and validation artifacts. Excessive output
+terminates the command rather than being buffered without limit.
+
+**Approval is tied to one filesystem snapshot.** After validation, the loop
+fingerprints HEAD, the index, tracked content, and untracked paths/content. It
+checks that identity again after reviewers finish. A reviewer hook, background
+process, or user edit during review invalidates the gates and fails the run
+closed instead of approving code that was never validated or reviewed.
 
 **The loop is capped.** Five rounds by default. Past that it stops and asks for
 a human, rather than negotiating with itself indefinitely.
@@ -300,6 +321,12 @@ Tunable in the run config:
 | `max_file_chars` | `20000` | Per-file cap before truncation |
 | `max_diff_chars` | `120000` | Whole-payload ceiling |
 
+Every numeric limit and timeout is validated as an in-range integer before a
+run detaches. Copilot-backed panels cap `max_diff_chars` at 400,000 because its
+non-interactive prompt travels in argv on macOS. Runtime booleans, exclusions,
+severities, permission modes and
+agent slot fields are likewise shape-checked before launch.
+
 ## Configuration
 
 Save defaults to `~/.review-loop/defaults.json` so you are not re-answering the
@@ -315,7 +342,24 @@ wizard every time:
 }
 ```
 
-Per-run configuration lives in `.review-loop/history/run-NN/config.json`.
+Per-run configuration lives in
+`<git-admin-dir>/review-loop/history/run-NN/config.json`. Explicit non-Git runs
+use a path-keyed directory below `~/.review-loop/state/non-git/` (or
+`REVIEW_LOOP_STATE_ROOT` when configured).
+
+### Build-agent permissions
+
+Only `acceptEdits` and `bypassPermissions` are supported. The adapters map
+those portable names to their actual CLI contracts:
+
+| CLI | `acceptEdits` | `bypassPermissions` |
+|---|---|---|
+| Claude Code | native `--permission-mode acceptEdits` | native `--permission-mode bypassPermissions` |
+| Copilot CLI | file writes approved; shell denied; no blanket MCP approval | `--allow-all` (tools, paths and URLs) |
+| Codex | `workspace-write` sandbox | `--dangerously-bypass-approvals-and-sandbox` |
+
+The modes are not identical across products; the table is the guarantee.
+Reviewer isolation always overrides this setting.
 
 ### Multiple accounts
 
@@ -332,12 +376,12 @@ Off by default.
 
 ## Working files
 
-Everything lands in `.review-loop/` in the target repository, which the tool
-adds to `.gitignore` on first run.
+Everything lands outside the target worktree. For a normal Git repository the
+layout is below Git's per-worktree administrative directory:
 
 ```text
-.review-loop/
-  .gitignore                  keeps this directory out of git
+<git-admin-dir>/review-loop/
+  .owner                      validated state ownership marker
   task.md
   final.md                    ← read this
   lock                        one active run per worktree
@@ -349,7 +393,7 @@ adds to `.gitignore` on first run.
     review-NN-<persona>.json  each reviewer's raw verdict
     validation-00.json        baseline, before the build agent ran
     validation-NN.json        test/lint/typecheck results
-    logs/                     full transcript per invocation
+    logs/                     bounded transcript per invocation
 ```
 
 ## Direct CLI use
@@ -365,8 +409,9 @@ review_loop.py status  --tail 20           # raw events, for scripts
 review_loop.py stop [--kill]
 ```
 
-`start` returns immediately and always exits `0`; the run continues in the
-background. For CI, use `run` instead, which executes in the foreground and
+On a successful launch, `start` returns immediately with the run directory and
+the run continues in the background. Invalid or unsafe launches exit nonzero
+before detaching. For CI, use `run`, which executes in the foreground and
 exits with the result:
 
 ```bash
@@ -376,28 +421,32 @@ python3 skills/review-loop/scripts/review_loop.py run --config run.json
 | Exit | Meaning |
 |---|---|
 | `0` | Approved — full panel reported, no blocking findings, validation passing (or `approved_unverified` when `allow_missing_validation` is set) |
-| `1` | Could not run — invalid config, unsafe repository, another run already active, build agent failed, no usable CLI |
+| `1` | Could not run — invalid config, unsafe repository, another run already active, build agent failed, Git safety/diff failure, or unexpected orchestration failure |
 | `2` | Finished with blocking findings outstanding, hit the iteration cap, or could not approve because the panel was incomplete or ungated |
 
 For CI, treat only exit `0` as a pass, and check `outcome` in `final.md` if you
 want to distinguish `approved` from `approved_unverified`.
 
-`status` and `stop` operate on the newest run in the current directory; pass
+Unexpected exceptions fail closed with `run_failed` and `run_complete` events,
+a final report, exit `1`, and lock release.
+
+`status` and `stop` operate on the newest run in the current worktree; pass
 `--repo <path>` or `--run <dir>` to target another.
 
 ## Known limits
 
-- **Only Codex can hard-constrain reviewer output to a JSON Schema**
-  (`--output-schema`). Every adapter's output is therefore validated in code
-  for shape, not just parsed — an explicit verdict, a `findings` list, and
-  objects inside it — with one repair retry. Anything that fails is recorded as
-  a reviewer that did not report, never guessed at and never read as approval.
+- **Codex and current Claude Code versions can constrain reviewer output to a
+  JSON Schema.** Codex receives `--output-schema`; Claude receives inline
+  `--json-schema` only when its installed CLI advertises the flag. Older Claude
+  versions and Copilot safely fall back to prompt shaping. Every adapter's
+  output is still validated in code, with one repair retry; malformed output is
+  never guessed at or read as approval.
 - **Copilot model availability is governed by your GitHub organisation's
   policy.** The picker enumerates at runtime and falls back to `auto`.
 - **The build agent needs non-interactive write permission.** The default is
-  `acceptEdits`; if runs stall waiting for approval, set `permission_mode` to
-  `bypassPermissions` in the config — and prefer running in a worktree or
-  container when you do.
+  `acceptEdits`, with the adapter-specific behavior documented above. Use
+  `bypassPermissions` only when the task requires its broader capabilities,
+  preferably inside a disposable worktree or container.
 - **Reviewers read the diff plus the repository, not a running system.** They
   will not catch what only an integration environment reveals.
 

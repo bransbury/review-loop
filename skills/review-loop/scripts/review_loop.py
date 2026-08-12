@@ -19,6 +19,9 @@ interactive wizard, calls `start`, then tails progress.jsonl to render the UI.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -32,9 +35,11 @@ import textwrap
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PERSONA_DIR = SKILL_DIR / "personas"
@@ -42,6 +47,16 @@ SCHEMA_PATH = SKILL_DIR / "schemas" / "review.json"
 
 SEVERITIES = ["blocker", "high", "medium", "low", "nit"]
 STATE_DIRNAME = ".review-loop"
+PERMISSION_MODES = ["acceptEdits", "bypassPermissions"]
+MAX_REVIEWERS = 8
+MAX_VALIDATION_COMMANDS = 32
+MAX_AGENT_WORKERS = 4
+MAX_TASK_CHARS = 100_000
+MAX_COMMAND_CHARS = 16_384
+MAX_GIT_CAPTURE_BYTES = 16 * 1024 * 1024
+MAX_FINGERPRINT_FILES = 100_000
+MAX_FINGERPRINT_FILE_BYTES = 512 * 1024 * 1024
+STATE_OWNER = "review-loop managed state v1"
 
 
 def installed_version() -> str:
@@ -66,7 +81,7 @@ def installed_version() -> str:
 # to add a new harness.
 
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-COPILOT_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
+COPILOT_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
 
 # Fallbacks only. `detect` prefers live enumeration where the CLI allows it,
@@ -76,8 +91,29 @@ CODEX_MODELS_FALLBACK = ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.
 COPILOT_MODELS_FALLBACK = ["auto"]
 
 
+@lru_cache(maxsize=8)
+def _claude_supports_json_schema(executable: str) -> bool:
+    """Probe the installed CLI instead of assuming every version has the flag."""
+    try:
+        result = subprocess.run([executable, "--help"], capture_output=True,
+                                text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "--json-schema" in result.stdout
+
+
+@lru_cache(maxsize=8)
+def _claude_supports_safe_mode(executable: str) -> bool:
+    try:
+        result = subprocess.run([executable, "--help"], capture_output=True,
+                                text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "--safe-mode" in result.stdout
+
+
 def _claude_argv(prompt: str, model: str, effort: str, readonly: bool,
-                 permission_mode: str, out_file: Path) -> tuple[list[str], str | None]:
+                 permission_mode: str, out_file: Path) -> tuple[list[str], Optional[str]]:
     # Prompt goes on stdin: a large diff would otherwise risk ARG_MAX.
     argv = ["claude", "-p", "--output-format", "json"]
     if model:
@@ -86,19 +122,31 @@ def _claude_argv(prompt: str, model: str, effort: str, readonly: bool,
         argv += ["--effort", effort]
     if readonly:
         # Belt and braces: plan mode cannot write, and the tools are denied too.
+        executable = shutil.which("claude") or "claude"
         argv += ["--permission-mode", "plan",
                  "--disallowed-tools", "Edit", "Write", "NotebookEdit"]
+        if _claude_supports_safe_mode(executable):
+            argv += ["--safe-mode"]
+        else:
+            # Safe fallback used by older releases that predate --safe-mode.
+            argv += ["--setting-sources", ""]
+        if SCHEMA_PATH.exists() and _claude_supports_json_schema(executable):
+            # Claude accepts the schema inline, unlike Codex's file-path flag.
+            # Older versions safely fall back to prompt shaping plus parser
+            # validation because capability detection simply omits this flag.
+            schema = json.dumps(json.loads(SCHEMA_PATH.read_text()), separators=(",", ":"))
+            argv += ["--json-schema", schema]
     else:
         argv += ["--permission-mode", permission_mode]
     return argv, prompt
 
 
 def _copilot_argv(prompt: str, model: str, effort: str, readonly: bool,
-                  permission_mode: str, out_file: Path) -> tuple[list[str], str | None]:
+                  permission_mode: str, out_file: Path) -> tuple[list[str], Optional[str]]:
     # Copilot has no stdin prompt mode, so the text goes in argv. ARG_MAX is
     # 1MB on macOS and 2MB on Linux; the diff cap keeps us well clear.
     argv = ["copilot", "--prompt", prompt,
-            "--allow-all-tools", "--no-ask-user", "--silent", "--no-color"]
+            "--no-ask-user", "--silent", "--no-color"]
     if model and model != "auto":
         argv += ["--model", model]
     if effort:
@@ -108,13 +156,27 @@ def _copilot_argv(prompt: str, model: str, effort: str, readonly: bool,
         # permissions help says so — and denials override --allow-all-tools.
         # Denying specific commands is therefore useless: `sed -i`, `rm` and a
         # shell redirection all still mutate the tree. Deny the shell outright
-        # and leave the reviewer its read-only file tools.
-        argv += ["--deny-tool", "write", "--deny-tool", "shell"]
+        # and leave the reviewer its read-only tools. Do not blanket-approve
+        # every tool: that would also approve side-effecting MCP calls.
+        argv += ["--available-tools=view,grep,glob", "--disable-builtin-mcps",
+                 "--no-custom-instructions", "--deny-tool", "write",
+                 "--deny-tool", "shell"]
+    elif permission_mode == "acceptEdits":
+        # Copilot has no acceptEdits mode. Its closest safe equivalent is to
+        # approve its local write permission while denying the shell outright,
+        # without blanket-approving MCP tools. The shell denial
+        # matters because Copilot's `write` permission does not cover shell
+        # redirections or commands such as `sed -i`.
+        argv += ["--allow-tool", "write", "--deny-tool", "shell"]
+    elif permission_mode == "bypassPermissions":
+        # `--allow-all` includes tools, paths and URLs. This is deliberately
+        # broader than --allow-all-tools and matches the advertised bypass.
+        argv += ["--allow-all"]
     return argv, None
 
 
 def _codex_argv(prompt: str, model: str, effort: str, readonly: bool,
-                permission_mode: str, out_file: Path) -> tuple[list[str], str | None]:
+                permission_mode: str, out_file: Path) -> tuple[list[str], Optional[str]]:
     # `-` makes codex exec read the prompt from stdin.
     argv = ["codex", "exec", "--skip-git-repo-check", "-o", str(out_file)]
     if model:
@@ -123,11 +185,16 @@ def _codex_argv(prompt: str, model: str, effort: str, readonly: bool,
         argv += ["-c", f"model_reasoning_effort={effort}"]
     if readonly:
         argv += ["-s", "read-only"]
-        # Codex is the only harness that can hard-constrain the response shape.
+        # Codex accepts the schema by path; current Claude versions take it
+        # inline, while older Claude and Copilot use validated parser fallback.
         if SCHEMA_PATH.exists():
             argv += ["--output-schema", str(SCHEMA_PATH)]
-    else:
+    elif permission_mode == "acceptEdits":
+        # Codex has sandbox/approval policies rather than Claude-style modes.
+        # workspace-write is its bounded, unattended editing contract.
         argv += ["-s", "workspace-write"]
+    elif permission_mode == "bypassPermissions":
+        argv += ["--dangerously-bypass-approvals-and-sandbox"]
     argv += ["-"]
     return argv, prompt
 
@@ -227,10 +294,21 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     panel that misses the security reviewer on an auth change is worse than
     useless. This is advisory only — the wizard still asks.
     """
-    repo = Path(args.repo or os.getcwd()).resolve()
+    configured = Path(args.repo or os.getcwd())
+    try:
+        repo = canonical_worktree_root(configured)
+        paths = [p.lower() for p in git(repo, "ls-files").splitlines()][:5000]
+    except RuntimeError:
+        # Suggestion is read-only and precedes the wizard's allow_non_git
+        # choice. A directory with no Git metadata has no repository signals,
+        # but task-keyword routing remains useful. Existing broken Git metadata
+        # is still an error rather than silently treated as non-Git.
+        resolved = configured.expanduser().resolve()
+        if _has_git_marker(resolved):
+            raise
+        repo = resolved
+        paths = []
     task = (args.task or "").lower()
-
-    paths = [p.lower() for p in git(repo, "ls-files").splitlines()][:5000]
 
     suggested, considered = [], []
     for path in sorted(PERSONA_DIR.glob("*.md")):
@@ -302,7 +380,7 @@ def _signal_hit(signal: str, paths: list[str]) -> bool:
     return any(signal in p.strip("/").split("/") for p in paths)
 
 
-def _invoking_harness() -> str | None:
+def _invoking_harness() -> Optional[str]:
     """Best-effort guess at which harness is running us, for wizard defaults."""
     if os.environ.get("CLAUDE_CODE") or os.environ.get("CLAUDECODE"):
         return "claude"
@@ -339,15 +417,55 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     config with no reviewers would otherwise "approve" instantly and look
     like a clean review.
     """
+    if not isinstance(config, dict):
+        return ["run config must be a JSON object."]
     errors: list[str] = []
 
-    if not str(config.get("task", "")).strip():
+    numeric_fields = {
+        "max_iterations": (1, 20, 5),
+        "agent_timeout_seconds": (1, 86_400, 3600),
+        "validation_timeout_seconds": (1, 86_400, 1800),
+        "max_log_chars": (4, 2_000_000, 100_000),
+        "max_file_chars": (1, 1_000_000, 20_000),
+        "max_untracked_files": (0, 1_000, 60),
+        "max_diff_chars": (1, 2_000_000, 120_000),
+    }
+    for field, (minimum, maximum, default) in numeric_fields.items():
+        value = config.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"`{field}` must be an integer.")
+        elif value < minimum:
+            errors.append(f"`{field}` must be at least {minimum}.")
+        elif value > maximum:
+            errors.append(f"`{field}` must be at most {maximum}.")
+
+    for field in ("allow_dirty", "allow_non_git", "allow_missing_validation",
+                  "require_clean_baseline", "parallel", "exclude_noise"):
+        if field in config and not isinstance(config[field], bool):
+            errors.append(f"`{field}` must be true or false.")
+
+    if "repo" in config and (not isinstance(config["repo"], str)
+                             or not config["repo"].strip()):
+        errors.append("`repo` must be a non-empty path string.")
+    exclude_paths = config.get("exclude_paths", [])
+    if not isinstance(exclude_paths, list) or any(
+            not isinstance(path, str) or not path.strip() for path in exclude_paths):
+        errors.append("`exclude_paths` must be a list of non-empty path strings.")
+
+    permission_mode = config.get("permission_mode", "acceptEdits")
+    if permission_mode not in PERMISSION_MODES:
+        errors.append(f"permission_mode must be one of {PERMISSION_MODES}, "
+                      f"got {permission_mode!r}.")
+
+    if not isinstance(config.get("task"), str) or not config["task"].strip():
         errors.append("`task` is required and cannot be empty.")
+    elif len(config["task"]) > MAX_TASK_CHARS:
+        errors.append(f"`task` must be at most {MAX_TASK_CHARS} characters.")
 
     impl = config.get("implementer")
     if not isinstance(impl, dict):
         errors.append("`implementer` is required.")
-    elif impl.get("cli") not in ADAPTERS:
+    elif not isinstance(impl.get("cli"), str) or impl.get("cli") not in ADAPTERS:
         errors.append(f"implementer.cli must be one of {sorted(ADAPTERS)}, "
                       f"got {impl.get('cli')!r}.")
 
@@ -355,6 +473,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if not isinstance(reviewers, list) or not reviewers:
         errors.append("At least one reviewer is required.")
         reviewers = []
+    elif len(reviewers) > MAX_REVIEWERS:
+        errors.append(f"At most {MAX_REVIEWERS} reviewers may be configured.")
 
     seen: dict[str, int] = {}
     for i, rv in enumerate(reviewers):
@@ -365,9 +485,16 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         if not persona:
             errors.append(f"reviewers[{i}].persona is required.")
             continue
-        if rv.get("cli") not in ADAPTERS:
+        if not isinstance(persona, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", persona):
+            errors.append(f"reviewers[{i}].persona must contain only lowercase letters, "
+                          "digits, and hyphens.")
+            continue
+        if not isinstance(rv.get("cli"), str) or rv.get("cli") not in ADAPTERS:
             errors.append(f"reviewers[{i}].cli must be one of {sorted(ADAPTERS)}, "
                           f"got {rv.get('cli')!r}.")
+        for field in ("label", "label_base"):
+            if field in rv and (not isinstance(rv[field], str) or not rv[field].strip()):
+                errors.append(f"reviewers[{i}].{field} must be a non-empty string.")
         # The same persona may legitimately appear twice on different models.
         # Give each slot a unique id so their outputs, log files and finding
         # ids stay distinct — and so they can corroborate each other.
@@ -377,12 +504,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         # result. `start` validates a config and then the detached `run`
         # validates the file it wrote, so anything appended in place would be
         # appended twice — "Security Engineer #2 #2".
-        if not rv.get("label_base"):
+        if not isinstance(rv.get("label_base"), str) or not rv["label_base"].strip():
             # Prefer the persona's own name ("Adversarial QA") over title-casing
             # the slug, which mangles acronyms into "Adversarial Qa".
             meta = _persona_meta(PERSONA_DIR / f"{persona}.md") \
                 if (PERSONA_DIR / f"{persona}.md").exists() else {}
-            rv["label_base"] = (rv.get("label")
+            supplied_label = rv.get("label") if isinstance(rv.get("label"), str) else None
+            rv["label_base"] = (supplied_label
                                 or meta.get("name")
                                 or persona.replace("-", " ").title())
         rv["label"] = rv["label_base"] if seen[persona] == 1 \
@@ -391,13 +519,37 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     for slot in ([impl] if isinstance(impl, dict) else []) + \
                 [r for r in reviewers if isinstance(r, dict)]:
         cli = slot.get("cli")
-        ad = ADAPTERS.get(cli)
+        ad = ADAPTERS.get(cli) if isinstance(cli, str) else None
         if ad and not shutil.which(ad["bin"]):
             errors.append(f"`{ad['bin']}` is configured but not on PATH.")
         effort = slot.get("effort")
+        if effort is not None and (not isinstance(effort, str) or not effort.strip()):
+            errors.append(f"{cli or 'agent'}.effort must be a non-empty string.")
         if ad and effort and effort not in ad["efforts"]:
             errors.append(f"effort {effort!r} is not supported by {cli}; "
                           f"choose from {ad['efforts']}.")
+        for field in ("model", "config_dir"):
+            if field in slot and (not isinstance(slot[field], str)
+                                  or not slot[field].strip()):
+                errors.append(f"{cli or 'agent'}.{field} must be a non-empty string.")
+
+    all_slots = ([impl] if isinstance(impl, dict) else []) + \
+        [r for r in reviewers if isinstance(r, dict)]
+    configured_diff_cap = config.get("max_diff_chars", 120_000)
+    if any(slot.get("cli") == "copilot" for slot in all_slots) \
+            and isinstance(configured_diff_cap, int) \
+            and not isinstance(configured_diff_cap, bool) \
+            and configured_diff_cap > 400_000:
+        errors.append("`max_diff_chars` must be at most 400000 when Copilot is "
+                      "configured because its prompt is passed in argv on macOS.")
+
+    for field in ("run_dir", "lock_token"):
+        if field in config and (not isinstance(config[field], str)
+                                or not config[field].strip()):
+            errors.append(f"`{field}` must be a non-empty string when present.")
+    if ("run_dir" in config) != ("lock_token" in config):
+        errors.append("`run_dir` and `lock_token` are internal handoff fields and "
+                      "must either both be present or both be absent.")
 
     # The independent gate is the reason this tool is worth running. Validate
     # its shape before treating it as present: a string would otherwise be run
@@ -418,8 +570,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             validation_shape_ok = False
         else:
             commands = raw_commands
+            if len(commands) > MAX_VALIDATION_COMMANDS:
+                errors.append(f"At most {MAX_VALIDATION_COMMANDS} validation commands "
+                              "may be configured.")
+                validation_shape_ok = False
             bad_commands = [i for i, cmd in enumerate(commands)
-                            if not isinstance(cmd, str) or not cmd.strip()]
+                            if not isinstance(cmd, str) or not cmd.strip()
+                            or len(cmd) > MAX_COMMAND_CHARS]
             if bad_commands:
                 errors.append("`validation.commands` contains empty or non-string entries "
                               f"at indexes {bad_commands}.")
@@ -432,15 +589,21 @@ def validate_config(config: dict[str, Any]) -> list[str]:
                       "Add commands, or set `allow_missing_validation: true` to "
                       "accept a run whose outcome is unverified.")
 
-    bad = set(config.get("blocking_severities") or []) - set(SEVERITIES)
-    if bad:
-        errors.append(f"unknown blocking severities: {sorted(bad)}")
-
-    try:
-        if int(config.get("max_iterations", 5)) < 1:
-            errors.append("`max_iterations` must be at least 1.")
-    except (TypeError, ValueError):
-        errors.append("`max_iterations` must be a number.")
+    raw_blocking = config.get("blocking_severities", ["blocker", "high", "medium"])
+    if not isinstance(raw_blocking, list) or any(
+            not isinstance(severity, str) for severity in raw_blocking):
+        errors.append("`blocking_severities` must be a list of severity strings.")
+    else:
+        bad = set(raw_blocking) - set(SEVERITIES)
+        if bad:
+            errors.append(f"unknown blocking severities: {sorted(bad)}")
+        accepted = [s for s in SEVERITIES[:-1] if s in raw_blocking]
+        if "nit" in raw_blocking or not accepted:
+            errors.append("`blocking_severities` must contain `blocker` and cannot "
+                          "contain the discarded `nit` severity.")
+        elif accepted != SEVERITIES[:len(accepted)]:
+            errors.append("`blocking_severities` must be an upward-closed threshold "
+                          "starting with `blocker` (for example blocker/high/medium).")
 
     return errors
 
@@ -449,6 +612,32 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 # Run state
 # ---------------------------------------------------------------------------
 
+def _safe_write_text(path: Path, content: str, mode: int = 0o600) -> None:
+    """Atomically write a regular file without following a destination symlink."""
+    parent_mode = path.parent.lstat().st_mode
+    if stat.S_ISLNK(parent_mode) or not stat.S_ISDIR(parent_mode):
+        raise RuntimeError(f"unsafe state parent: {path.parent}")
+    if os.path.lexists(str(path)):
+        current = path.lstat().st_mode
+        if stat.S_ISLNK(current) or not stat.S_ISREG(current):
+            raise RuntimeError(f"refusing unsafe state file: {path}")
+    temp = path.parent / f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(temp), flags, mode)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
 class Run:
     def __init__(self, repo: Path, run_dir: Path, config: dict[str, Any]):
         self.repo = repo
@@ -456,6 +645,13 @@ class Run:
         self.config = config
         self.progress = run_dir / "progress.jsonl"
         self.stop_file = run_dir / "STOP"
+        self.snapshot: dict[str, Any] = {
+            "base_sha": None, "rounds": 0,
+            "validation_status": VALIDATION_NOT_CONFIGURED,
+            "baseline_status": VALIDATION_NOT_CONFIGURED,
+            "ledger": Ledger(), "stage": "launch",
+            "missing_reviewers": [],
+        }
         # Reviewers run concurrently and all emit here; without this the
         # progress stream can interleave into unparseable lines.
         self._lock = threading.Lock()
@@ -464,10 +660,21 @@ class Run:
         rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
         line = json.dumps(rec)
         with self._lock:
-            with self.progress.open("a") as fh:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(self.progress), flags, 0o600)
+            with os.fdopen(fd, "a") as fh:
                 fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             # Also echo for foreground/log tailing.
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except (BrokenPipeError, OSError):
+                # progress.jsonl is the durable contract. A closed foreground
+                # pipe must not prevent terminal reporting into that file.
+                pass
 
     def should_stop(self) -> bool:
         return self.stop_file.exists()
@@ -476,6 +683,472 @@ class Run:
 # ---------------------------------------------------------------------------
 # Agent invocation
 # ---------------------------------------------------------------------------
+
+def _marked_processes(marker: str,
+                      variable: str = "REVIEW_LOOP_PROCESS_TREE") -> set[int]:
+    """Find descendants by an inherited marker, even after setsid/reparenting."""
+    needle = f"{variable}={marker}".encode()
+    found: set[int] = set()
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").glob("[0-9]*/environ"):
+            try:
+                if needle + b"\0" in entry.read_bytes():
+                    found.add(int(entry.parent.name))
+            except (OSError, ValueError):
+                continue
+        return found
+    if sys.platform == "darwin":
+        # `ps` can be unavailable in a sandbox even for our own children.
+        # libproc enumerates pids and KERN_PROCARGS2 exposes the environment of
+        # same-user processes without relying on GNU-only /proc.
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            count = max(1, int(libproc.proc_listallpids(None, 0)))
+            pids = (ctypes.c_int * (count * 2))()
+            size = int(libproc.proc_listallpids(pids, ctypes.sizeof(pids)))
+            libc = ctypes.CDLL(None, use_errno=True)
+            for pid in pids[:size]:
+                if pid <= 0:
+                    continue
+                mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN,KERN_PROCARGS2
+                length = ctypes.c_size_t(0)
+                if libc.sysctl(mib, 3, None, ctypes.byref(length), None, 0) != 0 \
+                        or length.value == 0:
+                    continue
+                data = ctypes.create_string_buffer(length.value)
+                if libc.sysctl(mib, 3, data, ctypes.byref(length), None, 0) == 0 \
+                        and needle + b"\0" in data.raw[:length.value]:
+                    found.add(pid)
+        except (AttributeError, OSError, ValueError):
+            pass
+    return found
+
+
+def _signal_process_tree(group_pid: int, sig: int, marker: str) -> None:
+    """Signal the original group plus descendants that escaped that group."""
+    targets = _marked_processes(marker)
+    try:
+        os.killpg(group_pid, sig)
+    except OSError:
+        pass
+    # The environment marker is checked in the live process immediately before
+    # this snapshot. Do not retain bare historical PIDs: a short-lived helper's
+    # PID can be reused by an unrelated process during an hour-long agent run.
+    for pid in sorted(targets, reverse=True):
+        if pid in (os.getpid(), group_pid):
+            continue
+        if pid not in _marked_processes(marker):
+            continue
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def _process_snapshot() -> dict[int, tuple[int, str]]:
+    """Return pid -> (ppid, stable start identity) without child cooperation."""
+    out: dict[int, tuple[int, str]] = {}
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                raw = entry.read_text()
+                close = raw.rfind(")")
+                fields = raw[close + 2:].split()
+                out[int(entry.parent.name)] = (int(fields[1]), fields[19])
+            except (OSError, ValueError, IndexError):
+                continue
+        return out
+    if sys.platform == "darwin":
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            count = max(1, int(libproc.proc_listallpids(None, 0)))
+            pids = (ctypes.c_int * (count * 2))()
+            size = int(libproc.proc_listallpids(pids, ctypes.sizeof(pids)))
+            for pid in pids[:size]:
+                if pid <= 0:
+                    continue
+                info = ProcBsdInfo()
+                got = int(libproc.proc_pidinfo(
+                    pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)))
+                if got == ctypes.sizeof(info):
+                    identity = f"{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+                    out[pid] = (int(info.pbi_ppid), identity)
+        except (AttributeError, OSError, ValueError):
+            pass
+        return out
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart="],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) == 3:
+                out[int(fields[0])] = (int(fields[1]), fields[2])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return out
+
+
+_TOP_LEVEL_PIDS: set[int] = set()
+_TOP_LEVEL_LOCK = threading.Lock()
+_PROCESS_REGISTRY_LOCK = threading.Lock()
+
+
+class _ProcessTracker:
+    """Continuously record descendants by kernel ancestry and start identity."""
+
+    def __init__(self, root_pid: int, registry: Optional[Path] = None):
+        self.root_pid = root_pid
+        self.registry = registry
+        self.persisted: set[tuple[int, str]] = set()
+        self.identities: dict[int, str] = {}
+        self.stop_event = threading.Event()
+        snap = _process_snapshot()
+        if root_pid in snap:
+            self.identities[root_pid] = snap[root_pid][1]
+        with _TOP_LEVEL_LOCK:
+            _TOP_LEVEL_PIDS.add(root_pid)
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+        self._persist()
+        self.thread.start()
+
+    def _persist(self) -> None:
+        if self.registry is None:
+            return
+        pending = {(pid, identity) for pid, identity in self.identities.items()} \
+            - self.persisted
+        if not pending:
+            return
+        with _PROCESS_REGISTRY_LOCK:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(self.registry), flags, 0o600)
+            with os.fdopen(fd, "a") as handle:
+                for pid, identity in sorted(pending):
+                    handle.write(json.dumps({"pid": pid, "identity": identity}) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        self.persisted.update(pending)
+
+    def _scan(self) -> None:
+        snap = _process_snapshot()
+        known = {pid for pid, identity in self.identities.items()
+                 if snap.get(pid, (None, None))[1] == identity}
+        changed = True
+        while changed:
+            changed = False
+            with _TOP_LEVEL_LOCK:
+                top = set(_TOP_LEVEL_PIDS)
+            for pid, (ppid, identity) in snap.items():
+                if pid in known or pid in top:
+                    continue
+                if ppid in known:
+                    self.identities[pid] = identity
+                    known.add(pid)
+                    changed = True
+        self._persist()
+
+    def _watch(self) -> None:
+        while not self.stop_event.wait(0.01):
+            self._scan()
+
+    def live(self) -> set[int]:
+        self._scan()
+        snap = _process_snapshot()
+        return {pid for pid, identity in self.identities.items()
+                if snap.get(pid, (None, None))[1] == identity}
+
+    def signal(self, sig: int) -> None:
+        self._scan()
+        for pid in sorted(self.live(), reverse=True):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        try:
+            os.killpg(self.root_pid, sig)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=0.5)
+        with _TOP_LEVEL_LOCK:
+            _TOP_LEVEL_PIDS.discard(self.root_pid)
+
+
+class _BoundedBytes:
+    def __init__(self, limit: int):
+        self.limit = max(1, limit)
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+        self.exceeded = threading.Event()
+        self.lock = threading.Lock()
+
+    def add(self, data: bytes) -> None:
+        with self.lock:
+            self.total += len(data)
+            if self.total > self.limit:
+                self.exceeded.set()
+            half = max(1, self.limit // 2)
+            if len(self.head) < half:
+                take = min(half - len(self.head), len(data))
+                self.head.extend(data[:take])
+                data = data[take:]
+            if data:
+                self.tail.extend(data)
+                if len(self.tail) > self.limit - len(self.head):
+                    del self.tail[:len(self.tail) - (self.limit - len(self.head))]
+
+    def text(self, errors: str = "replace") -> str:
+        with self.lock:
+            raw = bytes(self.head + self.tail)
+            omitted = max(0, self.total - len(raw))
+        text = raw.decode("utf-8", errors=errors)
+        if omitted:
+            split = len(self.head.decode("utf-8", errors=errors))
+            text = text[:split] + f"\n… [{omitted} bytes elided] …\n" + text[split:]
+        return text
+
+
+def _terminate_marked_processes(run_dir: Path, grace: float = 2.0) -> set[int]:
+    """Stop every live command tree belonging to a run, including new sessions."""
+    marker = str(run_dir.resolve())
+    variable = "REVIEW_LOOP_RUN_DIR"
+
+    def registered_live() -> set[int]:
+        identities: dict[int, str] = {}
+        registry = run_dir / "processes.jsonl"
+        try:
+            if stat.S_ISLNK(registry.lstat().st_mode):
+                return set()
+            for line in registry.read_text().splitlines():
+                record = json.loads(line)
+                if isinstance(record.get("pid"), int) and isinstance(
+                        record.get("identity"), str):
+                    identities[record["pid"]] = record["identity"]
+        except (OSError, ValueError, AttributeError):
+            pass
+        snap = _process_snapshot()
+        known = {pid for pid, identity in identities.items()
+                 if snap.get(pid, (None, None))[1] == identity}
+        # Capture live descendants before signaling a registered parent.
+        changed = True
+        while changed:
+            changed = False
+            for pid, (ppid, _identity) in snap.items():
+                if pid not in known and ppid in known:
+                    known.add(pid)
+                    changed = True
+        return known
+
+    def signal_live(sig: int) -> set[int]:
+        targets = (_marked_processes(marker, variable) | registered_live()) - {os.getpid()}
+        for pid in sorted(targets, reverse=True):
+            # Re-read the marker before each signal so PID reuse cannot turn a
+            # previously valid identity into authority over an unrelated task.
+            if pid not in _marked_processes(marker, variable) \
+                    and pid not in registered_live():
+                continue
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        return targets
+
+    signal_live(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    remaining = (_marked_processes(marker, variable) | registered_live()) - {os.getpid()}
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.05)
+        remaining = (_marked_processes(marker, variable) | registered_live()) - {os.getpid()}
+    if remaining:
+        signal_live(signal.SIGKILL)
+        kill_deadline = time.monotonic() + 1.0
+        while remaining and time.monotonic() < kill_deadline:
+            time.sleep(0.05)
+            remaining = (_marked_processes(marker, variable) | registered_live()) - {os.getpid()}
+    return remaining
+
+
+def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
+                      env: Optional[dict[str, str]] = None,
+                      input_text: Optional[str] = None,
+                      shell: bool = False,
+                      output_limit: int = 100_000,
+                      decode_errors: str = "replace") -> tuple[subprocess.CompletedProcess, bool]:
+    """Run a command in its own process group and reap the group on timeout.
+
+    macOS and Linux both provide POSIX process groups. Kernel process identities
+    also track descendants that escape the group or sanitize their environment.
+    Reader threads retain bounded head/tail output while the process runs and
+    keep draining through TERM/KILL cleanup.
+    """
+    marker = secrets.token_hex(16)
+    child_env = dict(os.environ if env is None else env)
+    child_env["REVIEW_LOOP_PROCESS_TREE"] = marker
+    gate_read, gate_write = os.pipe()
+    child_env["REVIEW_LOOP_GATE_FD"] = str(gate_read)
+    launcher = (
+        "import os,sys; "
+        "fd=int(os.environ.pop('REVIEW_LOOP_GATE_FD')); "
+        "os.read(fd,1); os.close(fd); "
+        "shell=sys.argv[1]=='1'; command=sys.argv[2:]; "
+        "os.execv('/bin/sh',['/bin/sh','-c',command[0]]) if shell else "
+        "os.execvpe(command[0],command,os.environ)"
+    )
+    command_args = [str(args)] if shell else [str(value) for value in args]
+    try:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", launcher, "1" if shell else "0", *command_args],
+                cwd=str(cwd), env=child_env, shell=False, pass_fds=(gate_read,),
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(gate_write)
+            raise
+    finally:
+        os.close(gate_read)
+    registry = None
+    run_dir_value = child_env.get("REVIEW_LOOP_RUN_DIR")
+    if run_dir_value:
+        registry = Path(run_dir_value) / "processes.jsonl"
+    try:
+        tracker = _ProcessTracker(proc.pid, registry)
+    except BaseException:
+        os.close(gate_write)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(timeout=2)
+        raise
+    if proc.pid not in tracker.identities:
+        # Do not launch the real command when this platform cannot provide a
+        # stable kernel identity for the supervisor process.
+        os.close(gate_write)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(timeout=2)
+        tracker.close()
+        raise RuntimeError("could not establish portable process-tree supervision")
+    os.write(gate_write, b"1")
+    os.close(gate_write)
+    stdout_buf = _BoundedBytes(output_limit)
+    stderr_buf = _BoundedBytes(max(4096, output_limit // 2))
+
+    def drain(pipe: Any, buffer: _BoundedBytes) -> None:
+        try:
+            while True:
+                chunk = pipe.read(8192)
+                if not chunk:
+                    break
+                buffer.add(chunk)
+        except (OSError, ValueError):
+            pass
+
+    readers = [threading.Thread(target=drain, args=(proc.stdout, stdout_buf), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, stderr_buf), daemon=True)]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    output_exceeded = False
+    try:
+        if input_text is not None and proc.stdin is not None:
+            proc.stdin.write(input_text.encode())
+            proc.stdin.close()
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            if stdout_buf.exceeded.is_set() or stderr_buf.exceeded.is_set():
+                output_exceeded = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.01)
+        if proc.poll() is not None:
+            for reader in readers:
+                reader.join(timeout=0.5)
+        output_exceeded = (output_exceeded or stdout_buf.exceeded.is_set()
+                           or stderr_buf.exceeded.is_set())
+        if not timed_out and not output_exceeded:
+            # A CLI may exit after launching a detached helper. The command is
+            # complete only when its recorded descendants are gone too.
+            remaining = ((tracker.live() | _marked_processes(marker)) - {proc.pid})
+            if remaining:
+                _signal_process_tree(proc.pid, signal.SIGTERM, marker)
+                tracker.signal(signal.SIGTERM)
+                grace = time.monotonic() + 1.0
+                while (tracker.live() - {proc.pid}) and time.monotonic() < grace:
+                    time.sleep(0.02)
+                _signal_process_tree(proc.pid, signal.SIGKILL, marker)
+                tracker.signal(signal.SIGKILL)
+        if timed_out or output_exceeded:
+            _signal_process_tree(proc.pid, signal.SIGTERM, marker)
+            tracker.signal(signal.SIGTERM)
+            grace = time.monotonic() + 1.0
+            while tracker.live() and time.monotonic() < grace:
+                time.sleep(0.02)
+            _signal_process_tree(proc.pid, signal.SIGKILL, marker)
+            tracker.signal(signal.SIGKILL)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            tracker.signal(signal.SIGKILL)
+            proc.wait(timeout=2)
+    except BaseException:
+        # No exception after Popen may leave a write-capable command alive.
+        _signal_process_tree(proc.pid, signal.SIGTERM, marker)
+        tracker.signal(signal.SIGTERM)
+        time.sleep(0.05)
+        _signal_process_tree(proc.pid, signal.SIGKILL, marker)
+        tracker.signal(signal.SIGKILL)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        raise
+    finally:
+        for pipe in (proc.stdout, proc.stderr, proc.stdin):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for reader in readers:
+            reader.join(timeout=1)
+        tracker.close()
+    stdout = stdout_buf.text(decode_errors)
+    stderr = stderr_buf.text(decode_errors)
+    rc = proc.returncode
+    if output_exceeded:
+        rc = rc if rc not in (None, 0) else 1
+        stderr += f"\noutput exceeded the {output_limit}-byte safety limit"
+    completed = subprocess.CompletedProcess(args, rc, stdout, stderr)
+    return completed, timed_out
 
 def invoke_agent(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
                  label: str, log_name: str, attempts: int = 1) -> tuple[bool, str]:
@@ -507,7 +1180,7 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
     work = run.dir / "work"
     work.mkdir(exist_ok=True)
     prompt_file = work / f"{log_name}.prompt.md"
-    prompt_file.write_text(prompt)
+    _safe_write_text(prompt_file, prompt)
     out_file = work / f"{log_name}.out.txt"
     log_file = run.dir / "logs" / f"{log_name}.log"
     log_file.parent.mkdir(exist_ok=True)
@@ -522,6 +1195,13 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
     )
 
     env = os.environ.copy()
+    if cli == "copilot":
+        # The permission contract is expressed entirely by argv. Parent-level
+        # blanket approvals must never widen acceptEdits or reviewer access.
+        for key in ("COPILOT_ALLOW_ALL", "COPILOT_ALLOW_ALL_TOOLS",
+                    "COPILOT_AUTO_APPROVE"):
+            env.pop(key, None)
+    env["REVIEW_LOOP_RUN_DIR"] = str(run.dir.resolve())
     env_key = ad["config_dir_env"]
     override = slot.get("config_dir")
     if env_key and override:
@@ -532,27 +1212,30 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
              model=slot.get("model"), effort=slot.get("effort"), readonly=readonly)
 
     timeout = int(run.config.get("agent_timeout_seconds", 3600))
-    try:
-        proc = subprocess.run(
-            argv, cwd=str(run.repo), env=env, timeout=timeout,
-            input=stdin_text, capture_output=True, text=True,
-        )
-    except subprocess.TimeoutExpired:
-        run.emit("agent_error", label=label, error=f"timed out after {timeout}s")
-        return False, f"{label} timed out after {timeout}s"
+    proc, timed_out = _run_process_tree(
+        argv, cwd=run.repo, env=env, timeout=timeout, input_text=stdin_text,
+        output_limit=int(run.config.get("max_log_chars", 100_000)))
 
     # Transcripts are for debugging a run, not archiving it. Keep the head and
     # tail of each stream: the middle of a long agent transcript is where the
     # least useful bytes live.
     log_cap = int(run.config.get("max_log_chars", 100_000))
-    log_file.write_text(
+    _safe_write_text(log_file,
         f"$ {' '.join(argv[:6])} ...\n\n"
         f"--- STDOUT ---\n{_head_tail(proc.stdout, log_cap)}\n"
         f"--- STDERR ---\n{_head_tail(proc.stderr, log_cap // 4)}"
     )
 
+    if timed_out:
+        run.emit("agent_error", label=label, error=f"timed out after {timeout}s")
+        return False, f"{label} timed out after {timeout}s"
+
     if ad["reads_out_file"] and out_file.exists():
-        text = out_file.read_text()
+        if out_file.lstat().st_size > log_cap:
+            run.emit("agent_error", label=label,
+                     error=f"agent output file exceeded {log_cap} bytes")
+            return False, f"{label} output exceeded the configured safety limit"
+        text = out_file.read_text(errors="replace")
     else:
         text = _extract_final_text(cli, proc.stdout)
 
@@ -567,10 +1250,11 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
                           "(ideally inside a git worktree) so the build agent can run tests.")
 
     elapsed = round(time.time() - started, 1)
-    if proc.returncode != 0 and not text.strip():
+    if proc.returncode != 0:
         run.emit("agent_error", label=label, rc=proc.returncode,
                  error=(proc.stderr or "").strip()[:600], seconds=elapsed)
-        return False, (proc.stderr or f"exit {proc.returncode}")[:600]
+        detail = (proc.stderr or text or f"exit {proc.returncode}").strip()
+        return False, detail[:600]
     if not text.strip():
         run.emit("agent_error", label=label, rc=proc.returncode,
                  error="agent produced no output", seconds=elapsed)
@@ -630,6 +1314,9 @@ def _extract_final_text(cli: str, stdout: str) -> str:
         try:
             env = json.loads(stdout)
             if isinstance(env, dict):
+                structured = env.get("structured_output")
+                if isinstance(structured, (dict, list)):
+                    return json.dumps(structured)
                 return str(env.get("result") or env.get("content") or stdout)
         except Exception:
             pass
@@ -664,11 +1351,11 @@ def _extract_final_text(cli: str, stdout: str) -> str:
 # Review parsing
 # ---------------------------------------------------------------------------
 
-def extract_json(text: str) -> dict[str, Any] | None:
+def extract_json(text: str) -> Optional[dict[str, Any]]:
     """Pull a review object out of model output.
 
-    Only Codex can be schema-constrained, so this has to cope with prose
-    wrappers, fenced blocks and trailing commentary from the other harnesses.
+    Older Claude versions and Copilot cannot be schema-constrained, so this
+    still copes with prose wrappers, fenced blocks and trailing commentary.
     """
     if not text:
         return None
@@ -704,11 +1391,11 @@ def _verdict(obj: dict[str, Any]) -> str:
     return "approved" if str(raw).strip().lower() == "approved" else "changes_requested"
 
 
-def review_problem(obj: dict[str, Any] | None) -> str | None:
+def review_problem(obj: Optional[dict[str, Any]]) -> Optional[str]:
     """Why this review object cannot be trusted, or None if it is well formed.
 
     `extract_json` only asks whether *something* JSON-shaped came back, and
-    only Codex can be schema-constrained, so the shape has to be checked here
+    not every adapter can be schema-constrained, so the shape has to be checked here
     for every adapter. Anything that fails this is a reviewer that did not
     report — never a reviewer that approved. The permissive readings are the
     dangerous ones: a missing verdict and a `findings` value that is not a list
@@ -716,22 +1403,47 @@ def review_problem(obj: dict[str, Any] | None) -> str | None:
     """
     if not isinstance(obj, dict):
         return "review was not a JSON object"
-    if "verdict" not in obj:
-        return "no verdict field"
-    verdict = _verdict(obj)
-    if not verdict:
-        return "empty verdict field"
+    allowed_top = {"verdict", "findings"}
+    extra_top = set(obj) - allowed_top
+    if extra_top:
+        return f"unexpected review fields: {sorted(extra_top)}"
+    raw_verdict = obj.get("verdict")
+    if not isinstance(raw_verdict, str) or raw_verdict not in (
+            "approved", "changes_requested"):
+        return "`verdict` must be `approved` or `changes_requested`"
+    verdict = raw_verdict
     findings = obj.get("findings")
     if not isinstance(findings, list):
         return f"`findings` was {type(findings).__name__}, not a list"
     if any(not isinstance(f, dict) for f in findings):
         return "`findings` contained entries that were not objects"
+    required = {"id", "severity", "file", "line", "category", "problem",
+                "impact", "recommended_fix"}
+    for index, finding in enumerate(findings):
+        assert isinstance(finding, dict)
+        if set(finding) != required:
+            missing = sorted(required - set(finding))
+            extra = sorted(set(finding) - required)
+            return (f"findings[{index}] fields did not match the schema "
+                    f"(missing={missing}, extra={extra})")
+        for field in ("id", "file", "category", "problem", "impact",
+                      "recommended_fix"):
+            if not isinstance(finding[field], str) or not finding[field].strip():
+                return f"findings[{index}].{field} must be a non-empty string"
+        if finding["severity"] not in SEVERITIES:
+            return f"findings[{index}].severity is not a known severity"
+        line = finding["line"]
+        if line is not None and (isinstance(line, bool) or not isinstance(line, int)
+                                 or line < 1):
+            return f"findings[{index}].line must be a positive integer or null"
     if verdict == "changes_requested" and not findings:
         return "requested changes but listed no findings"
+    if verdict == "approved" and findings:
+        return "approved verdict cannot contain findings"
     return None
 
 
-def normalise_findings(reviewer_id: str, obj: dict[str, Any] | None,
+def normalise_findings(reviewer_id: str, obj: Optional[dict[str, Any]],
                        max_findings: int = 10) -> list[dict[str, Any]]:
     """Parse and bound one reviewer's output.
 
@@ -894,9 +1606,190 @@ class Ledger:
 # Git + validation
 # ---------------------------------------------------------------------------
 
+class GitError(RuntimeError):
+    """A Git operation required for isolation or review could not complete."""
+
+
+def _git_toplevel(repo: Path) -> tuple[Optional[Path], str]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(repo),
+            capture_output=True, text=True,
+        )
+    except OSError as exc:
+        return None, str(exc)
+    top = result.stdout.strip()
+    if result.returncode == 0 and top:
+        return Path(top).resolve(), ""
+    return None, result.stderr.strip() or "not a Git working tree"
+
+
+def _has_git_marker(repo: Path) -> bool:
+    """Whether this path is nested under filesystem metadata for a worktree."""
+    return any(os.path.lexists(str(candidate / ".git"))
+               for candidate in (repo, *repo.parents))
+
+
+def canonical_worktree_root(repo: Path, allow_non_git: bool = False) -> Path:
+    """Return the one filesystem root that identifies this working tree.
+
+    Git state and locking must not be scoped to the directory named in a
+    config: two configs pointing at different subdirectories still operate on
+    the same files. Non-Git operation remains available only through the
+    explicit escape hatch and keeps the configured directory as its root.
+    """
+    resolved = repo.expanduser().resolve()
+    if not resolved.is_dir():
+        raise RuntimeError(f"repo path does not exist: {resolved}")
+    top, detail = _git_toplevel(resolved)
+    if top is not None:
+        return top
+    if allow_non_git and not _has_git_marker(resolved):
+        return resolved
+    if allow_non_git:
+        raise RuntimeError(
+            f"could not resolve the existing Git worktree at {resolved} ({detail}); "
+            "`allow_non_git` cannot mask this failure"
+        )
+    raise RuntimeError(
+        f"{resolved} is not a git working tree ({detail}). The build agent edits "
+        "files in place and there would be no way to see or undo what it changed. "
+        "Set `allow_non_git: true` to override."
+    )
+
+
+def resolve_config_repo(config: dict[str, Any]) -> tuple[Optional[Path], list[str]]:
+    """Resolve and persist the actual run root before any state is touched."""
+    raw = config.get("repo") or os.getcwd()
+    if not isinstance(raw, (str, os.PathLike)):
+        return None, ["`repo` must be a non-empty path string."]
+    configured = Path(raw).expanduser().resolve()
+    if not configured.is_dir():
+        return None, [f"repo path does not exist: {configured}"]
+    repo, detail = _git_toplevel(configured)
+    if repo is None:
+        if _has_git_marker(configured):
+            return None, [
+                f"could not resolve {configured} as a Git worktree ({detail}). The build agent "
+                "edits files in place and there would be no way to see or undo what it "
+                "changed. `allow_non_git` cannot override a failure inside an existing "
+                "Git worktree."
+            ]
+        if not config.get("allow_non_git"):
+            return None, [
+                f"{configured} is not a git working tree ({detail}). The build agent edits "
+                "files in place and there would be no way to see or undo what it changed. "
+                "Set `allow_non_git: true` to override."
+            ]
+        repo = configured
+        config["_git_worktree"] = False
+    else:
+        config["_git_worktree"] = True
+    config["repo"] = str(repo)
+    return repo, []
+
+
+def state_for_repo(repo: Path, git_worktree: Optional[bool] = None) -> Path:
+    """Return state outside the agent-cleanable worktree.
+
+    Git's per-worktree administrative directory is stable, unique for linked
+    worktrees, and is not touched by `git clean`. Explicit non-Git runs use a
+    private per-user state root keyed by the canonical repository path.
+    """
+    if git_worktree is not False:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo),
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            raise GitError(f"could not locate Git administrative directory: {exc}") from exc
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve() / "review-loop"
+        if git_worktree is True:
+            detail = result.stderr.strip() or "git rev-parse failed"
+            raise GitError(f"could not locate Git administrative directory: {detail}")
+    root = Path(os.environ.get(
+        "REVIEW_LOOP_STATE_ROOT",
+        str(Path.home() / ".review-loop" / "state"),
+    )).expanduser().resolve()
+    key = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:24]
+    return root / "non-git" / key
+
+
+def _validate_plain_directory(path: Path) -> None:
+    """Reject symlinks and unexpected filesystem objects in state ancestors."""
+    current = path
+    existing: list[Path] = []
+    while True:
+        if os.path.lexists(str(current)):
+            existing.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    for item in reversed(existing):
+        mode = item.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise RuntimeError(f"unsafe review-loop state path component: {item}")
+
+
+def _ensure_state_ignored(state: Path) -> None:
+    """Create or validate private, installer-owned orchestration state.
+
+    State is never placed at repository-controlled `.review-loop`. Every
+    existing component and ownership marker is checked with lstat so a planted
+    symlink or lookalike directory cannot redirect prompts, logs, or locks.
+    """
+    _validate_plain_directory(state.parent)
+    if os.path.lexists(str(state)):
+        mode = state.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise RuntimeError(f"refusing unsafe review-loop state destination: {state}")
+        marker = state / ".owner"
+        try:
+            marker_mode = marker.lstat().st_mode
+            owner = marker.read_text()
+        except OSError as exc:
+            raise RuntimeError(f"unrecognized review-loop state directory: {state}") from exc
+        if stat.S_ISLNK(marker_mode) or not stat.S_ISREG(marker_mode) \
+                or owner.strip() != STATE_OWNER:
+            raise RuntimeError(f"unrecognized review-loop state directory: {state}")
+    else:
+        state.mkdir(parents=True, mode=0o700)
+        os.chmod(state, 0o700)
+        marker = state / ".owner"
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(STATE_OWNER + "\n")
+
+    # Critical children are never allowed to be symlinks. Run contents are
+    # checked again when a run is resolved from CLI input.
+    for child in ("history", "lock", "lock.guard", "current-run", "final.md"):
+        candidate = state / child
+        if os.path.lexists(str(candidate)):
+            child_mode = candidate.lstat().st_mode
+            expected = stat.S_ISDIR(child_mode) if child == "history" \
+                else stat.S_ISREG(child_mode)
+            if stat.S_ISLNK(child_mode) or not expected:
+                raise RuntimeError(f"unsafe object in review-loop state: {candidate}")
+
+def _git_capture(repo: Path, *args: str, limit: int = MAX_GIT_CAPTURE_BYTES) -> str:
+    try:
+        r, timed_out = _run_process_tree(
+            ["git", *args], cwd=repo, timeout=120, output_limit=limit,
+            decode_errors="surrogateescape")
+    except OSError as exc:
+        raise GitError(f"could not run git {' '.join(args)}: {exc}") from exc
+    if timed_out:
+        raise GitError(f"git {' '.join(args)} timed out")
+    if r.returncode != 0:
+        detail = r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}"
+        raise GitError(f"git {' '.join(args)} failed: {detail}")
+    return r.stdout
+
+
 def git(repo: Path, *args: str) -> str:
-    r = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
-    return r.stdout.strip()
+    return _git_capture(repo, *args).strip()
 
 
 def _porcelain_entries(raw: str) -> list[tuple[str, str]]:
@@ -922,16 +1815,6 @@ def _porcelain_entries(raw: str) -> list[tuple[str, str]]:
     return out
 
 
-def _is_state_path(path: str) -> bool:
-    """Whether a repository path is the orchestrator's own state directory.
-
-    Exact match or a directory prefix — a `startswith` on the bare name also
-    swallows sibling files like `.review-loop-config`, which are the user's.
-    """
-    p = path.rstrip("/")
-    return p == STATE_DIRNAME or p.startswith(STATE_DIRNAME + "/")
-
-
 def preflight_repo(repo: Path, config: dict[str, Any]) -> list[str]:
     """Refuse to run somewhere the loop could do damage it cannot undo.
 
@@ -943,21 +1826,40 @@ def preflight_repo(repo: Path, config: dict[str, Any]) -> list[str]:
     if not repo.is_dir():
         return [f"repo path does not exist: {repo}"]
 
-    inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                            cwd=str(repo), capture_output=True, text=True)
-    if inside.returncode != 0 or inside.stdout.strip() != "true":
-        if not config.get("allow_non_git"):
+    if config.get("_git_worktree") is False:
+        return []
+
+    try:
+        inside = _git_capture(repo, "rev-parse", "--is-inside-work-tree",
+                              limit=64 * 1024).strip()
+    except (OSError, GitError) as exc:
+        if config.get("allow_non_git") and "_git_worktree" not in config \
+                and not _has_git_marker(repo):
+            return []
+        if not _has_git_marker(repo) and not config.get("allow_non_git"):
+            return [f"{repo} is not a git working tree. The build agent edits "
+                    "files in place and there would be no way to undo changes. "
+                    "Set `allow_non_git: true` to override."]
+        return [f"could not verify Git worktree identity: {exc}"]
+    if inside != "true":
+        if config.get("_git_worktree") is True:
+            problems.append("could not re-verify the resolved Git worktree")
+        elif config.get("allow_non_git") and _has_git_marker(repo):
+            problems.append("could not verify the existing Git worktree; "
+                            "`allow_non_git` cannot mask this failure")
+        elif not config.get("allow_non_git"):
             problems.append(f"{repo} is not a git working tree. The build agent edits "
                             "files in place and there would be no way to see or undo "
                             "what it changed. Set `allow_non_git: true` to override.")
         return problems
 
-    # --porcelain omits ignored files, so `.review-loop/` normally never trips
-    # this — but an older run, or a user who deleted its .gitignore, still can,
-    # and orchestration state is not the user's work.
-    raw = subprocess.run(["git", "status", "--porcelain", "-z"],
-                         cwd=str(repo), capture_output=True, text=True).stdout
-    dirty = [path for _, path in _porcelain_entries(raw) if not _is_state_path(path)]
+    # Orchestration state is outside the worktree, so every dirty path reported
+    # here belongs to the repository and must participate in the safety gate.
+    try:
+        raw = _git_capture(repo, "status", "--porcelain", "-z")
+    except (OSError, GitError) as exc:
+        return [f"could not verify working-tree cleanliness: {exc}"]
+    dirty = [path for _, path in _porcelain_entries(raw)]
     if dirty and not config.get("allow_dirty"):
         names = dirty[:10]
         more = f" (+{len(dirty) - 10} more)" if len(dirty) > 10 else ""
@@ -984,9 +1886,21 @@ def new_lock_token() -> str:
     return secrets.token_hex(16)
 
 
+@contextmanager
+def _lock_guard(state: Path):
+    """Serialize lock read/compare/write transitions across processes."""
+    guard = state / "lock.guard"
+    with guard.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def acquire_lock(state: Path, token: str, pid: int,
-                 run_dir: Path | None = None,
-                 adopt_only: bool = False) -> str | None:
+                 run_dir: Optional[Path] = None,
+                 adopt_only: bool = False) -> Optional[str]:
     """Claim the one-run-per-worktree lock. Returns an error string, or None.
 
     Two concurrent runs would edit the same files, review each other's
@@ -1003,6 +1917,13 @@ def acquire_lock(state: Path, token: str, pid: int,
     parent-held lock is gone, it must fail rather than recreate the lock and
     replay an old resolved config over an existing run directory.
     """
+    with _lock_guard(state):
+        return _acquire_lock_unlocked(state, token, pid, run_dir, adopt_only)
+
+
+def _acquire_lock_unlocked(state: Path, token: str, pid: int,
+                           run_dir: Optional[Path],
+                           adopt_only: bool) -> Optional[str]:
     lock = state / "lock"
 
     def payload(tok: str) -> str:
@@ -1018,7 +1939,7 @@ def acquire_lock(state: Path, token: str, pid: int,
             # `os.link` fails if the target exists, so the file is never partial.
             tmp = state / f"lock.{os.getpid()}.{secrets.token_hex(4)}"
             try:
-                tmp.write_text(payload(token))
+                _safe_write_text(tmp, payload(token))
                 try:
                     os.link(str(tmp), str(lock))
                     return None
@@ -1058,8 +1979,11 @@ def acquire_lock(state: Path, token: str, pid: int,
             held = {}
 
         if held.get("token") and held.get("token") == token:
+            if adopt_only and held.get("run_dir") not in (None, str(run_dir)):
+                return ("could not adopt the review-loop lock: its reserved run "
+                        "directory does not match this resolved config.")
             # Our own handoff. Rotate the token so it cannot be replayed.
-            lock.write_text(payload(new_lock_token()))
+            _safe_write_text(lock, payload(new_lock_token()))
             return None
         other_pid = held.get("pid")
         if isinstance(other_pid, int) and other_pid > 0 and _pid_alive(other_pid):
@@ -1086,38 +2010,59 @@ def handoff_lock(state: Path, token: str, pid: int, run_dir: Path) -> None:
     makes it a no-op once the child has adopted the lock — or released it.
     """
     lock = state / "lock"
-    try:
-        held = json.loads(lock.read_text())
-    except Exception:
-        return
-    if held.get("token") == token:
-        held.update({"pid": pid, "run_dir": str(run_dir)})
-        lock.write_text(json.dumps(held))
+    with _lock_guard(state):
+        try:
+            held = json.loads(lock.read_text())
+        except Exception:
+            return
+        if held.get("token") == token:
+            held.update({"pid": pid, "run_dir": str(run_dir)})
+            _safe_write_text(lock, json.dumps(held))
 
 
 def release_lock(state: Path, run_dir: Path) -> None:
     lock = state / "lock"
-    try:
-        held = json.loads(lock.read_text())
-    except Exception:
-        return
-    if held.get("run_dir") == str(run_dir):
+    with _lock_guard(state):
         try:
-            lock.unlink()
-        except FileNotFoundError:
-            pass
+            held = json.loads(lock.read_text())
+        except Exception:
+            return
+        if held.get("run_dir") == str(run_dir):
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
 
 
-def _state_for_run(run_dir: Path) -> Path | None:
+def release_starting_lock(state: Path, token: str) -> None:
+    """Release a lock that failed before it could be keyed to a run dir."""
+    lock = state / "lock"
+    with _lock_guard(state):
+        try:
+            held = json.loads(lock.read_text())
+        except Exception:
+            return
+        if held.get("token") == token and not held.get("run_dir"):
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _state_for_run(run_dir: Path) -> Optional[Path]:
     """Resolve the state directory from a standard history/run-NN path."""
     resolved = run_dir.resolve()
     if resolved.parent.name != "history":
         return None
     state = resolved.parent.parent
-    return state if state.name == STATE_DIRNAME else None
+    try:
+        _ensure_state_ignored(state)
+    except RuntimeError:
+        return None
+    return state
 
 
-def _locked_run_pid(run_dir: Path) -> int | None:
+def _locked_run_pid(run_dir: Path) -> Optional[int]:
     """Return the pid only when the live lock names this exact run.
 
     A run's pid file is historical evidence, not authority to signal forever:
@@ -1152,11 +2097,31 @@ def _pid_is_review_loop(pid: int, run_dir: Path) -> bool:
             and str((run_dir / "config.json").resolve()) in command)
 
 
-def base_commit(repo: Path) -> str | None:
+def base_commit(repo: Path, allow_non_git: bool = False,
+                git_worktree: Optional[bool] = None) -> Optional[str]:
     """The SHA the loop started from, or None in a repository with no commits."""
-    r = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
-                       cwd=str(repo), capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
+    if git_worktree is False:
+        return None
+    if allow_non_git and git_worktree is None:
+        try:
+            probe = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                                   cwd=str(repo), capture_output=True, text=True)
+        except OSError:
+            return None
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            return None
+    head_error: Optional[GitError] = None
+    try:
+        return git(repo, "rev-parse", "--verify", "HEAD")
+    except GitError as exc:
+        head_error = exc
+    # An unborn repository is supported. A repository with any reachable
+    # commit but an unreadable HEAD is corruption, not an empty baseline.
+    count = git(repo, "rev-list", "--all", "--count")
+    if count == "0":
+        return None
+    assert head_error is not None
+    raise head_error
 
 
 # Files whose diffs cost a great deal of context and tell a reviewer nothing
@@ -1176,7 +2141,7 @@ NOISE_PATHSPECS = [
 def _exclude_args(config: dict[str, Any]) -> list[str]:
     specs = NOISE_PATHSPECS if config.get("exclude_noise", True) else []
     specs = list(specs) + list(config.get("exclude_paths") or [])
-    return [f":(exclude,glob){s}" for s in specs] + [f":(exclude){STATE_DIRNAME}/*"]
+    return [f":(exclude,glob){s}" for s in specs]
 
 
 def _split_by_file(diff: str) -> list[tuple[str, str]]:
@@ -1198,24 +2163,46 @@ def _split_by_file(diff: str) -> list[tuple[str, str]]:
     return out
 
 
-def collect_diff(repo: Path, base_sha: str | None,
+def collect_diff(repo: Path, base_sha: Optional[str],
                  config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Build the review payload and report what it cost.
 
     Returns the diff text plus a manifest describing anything excluded or
     truncated, so a reviewer is never silently shown a partial picture.
     """
+    non_git = config.get("_git_worktree") is False
+    if config.get("allow_non_git") and "_git_worktree" not in config:
+        try:
+            probe = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                                   cwd=str(repo), capture_output=True, text=True)
+            non_git = probe.returncode != 0 or probe.stdout.strip() != "true"
+        except OSError:
+            non_git = True
+    if non_git:
+        text = ("[Non-Git run: no Git diff is available. Inspect the repository "
+                "directly before reaching a verdict.]\n")
+        return text, {"truncated_files": [], "skipped_files": [],
+                      "omitted_files": [], "untracked_files": 0,
+                      "untracked_included": 0, "chars": len(text),
+                      "approx_tokens": len(text) // 4, "files": 0,
+                      "non_git": True}
+
     excl = _exclude_args(config)
     parts: list[str] = []
-    ranges = [(f"{base_sha}..HEAD",), ("HEAD",)] if base_sha else [()]
+    # In an unborn repository there is no HEAD to compare against. The index
+    # and worktree are separate diffs; omitting --cached would hide every file
+    # the implementer staged before review.
+    ranges = ([(f"{base_sha}..HEAD",), ("HEAD",)] if base_sha
+              else [("--cached",), ()])
     for rng in ranges:
         d = git(repo, "diff", *rng, "--", ".", *excl)
         if d.strip():
             parts.append(d)
 
-    untracked = [f for f in git(repo, "ls-files", "--others", "--exclude-standard",
-                                "--", ".", *excl).splitlines()
-                 if f.strip() and not f.startswith(STATE_DIRNAME)]
+    untracked = [f for f in _git_capture(
+                    repo, "ls-files", "-z", "--others", "--exclude-standard",
+                    "--", ".", *excl).split("\0")
+                 if f.strip()]
 
     per_file = int(config.get("max_file_chars", 20000))
     max_untracked = int(config.get("max_untracked_files", 60))
@@ -1273,6 +2260,10 @@ def collect_diff(repo: Path, base_sha: str | None,
                     f"{listing}\n")
 
     diff = "".join(kept)
+    # Python represents undecodable POSIX filename bytes with surrogate code
+    # points. Escape those for JSON/prompts while retaining the original path
+    # object for lstat/open above.
+    diff = diff.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
     # Whole-payload ceiling, applied last so per-file trimming does the work.
     max_total = int(config.get("max_diff_chars", 120000))
@@ -1286,6 +2277,58 @@ def collect_diff(repo: Path, base_sha: str | None,
     return diff, manifest
 
 
+def worktree_fingerprint(repo: Path, config: dict[str, Any]) -> str:
+    """Hash the exact filesystem state covered by validation and review."""
+    digest = hashlib.sha256()
+    non_git = config.get("_git_worktree") is False
+    if non_git:
+        paths: list[str] = []
+        for root, dirs, files in os.walk(str(repo), followlinks=False):
+            dirs.sort()
+            files.sort()
+            base = Path(root)
+            paths.extend(str((base / name).relative_to(repo)) for name in dirs + files)
+    else:
+        try:
+            head = git(repo, "rev-parse", "--verify", "HEAD")
+        except GitError:
+            if git(repo, "rev-list", "--all", "--count") != "0":
+                raise
+            head = "(unborn)"
+        digest.update(head.encode())
+        digest.update(git(repo, "write-tree").encode())
+        raw = _git_capture(repo, "ls-files", "-z", "--cached", "--others",
+                           "--exclude-standard")
+        paths = [path for path in raw.split("\0") if path]
+    if len(paths) > MAX_FINGERPRINT_FILES:
+        raise GitError(f"worktree has more than {MAX_FINGERPRINT_FILES} files to fingerprint")
+    for relative in sorted(set(paths)):
+        full = repo / relative
+        digest.update(relative.encode("utf-8", errors="surrogateescape") + b"\0")
+        if not os.path.lexists(str(full)):
+            digest.update(b"(missing)\0")
+            continue
+        try:
+            info = full.lstat()
+            digest.update(str(stat.S_IFMT(info.st_mode)).encode() + b"\0")
+            if stat.S_ISLNK(info.st_mode):
+                digest.update(os.readlink(full).encode("utf-8", errors="surrogateescape"))
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_size > MAX_FINGERPRINT_FILE_BYTES:
+                    raise GitError(f"file too large to fingerprint safely: {relative}")
+                with full.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            else:
+                digest.update(f"special:{info.st_mode}".encode())
+        except FileNotFoundError as exc:
+            raise GitError(f"worktree changed while fingerprinting: {relative}") from exc
+    return digest.hexdigest()
+
+
 def diff_note(manifest: dict[str, Any], config: dict[str, Any]) -> str:
     """Tell the reviewer exactly what it is not being shown."""
     lines = []
@@ -1293,9 +2336,11 @@ def diff_note(manifest: dict[str, Any], config: dict[str, Any]) -> str:
         lines.append("Lockfiles, build output, binary assets and generated code are "
                      "excluded from this diff. Do not report on them.")
     for item in manifest.get("truncated_files", [])[:10]:
-        lines.append(f"NOTE: {item['path']} was truncated; inspect it directly if relevant.")
+        path = str(item["path"]).encode("utf-8", "backslashreplace").decode()
+        lines.append(f"NOTE: {path} was truncated; inspect it directly if relevant.")
     for item in manifest.get("skipped_files", [])[:10]:
-        lines.append(f"NOTE: {item['path']} was not inlined; read it from the repository.")
+        path = str(item["path"]).encode("utf-8", "backslashreplace").decode()
+        lines.append(f"NOTE: {path} was not inlined; read it from the repository.")
     omitted = manifest.get("omitted_files") or []
     if omitted:
         lines.append(f"NOTE: {len(omitted)} new files exceeded the untracked-file cap and "
@@ -1328,13 +2373,16 @@ def run_validation(run: Run, label: str = "") -> tuple[str, list[dict[str, Any]]
     for cmd in cmds:
         run.emit("validation_start", command=cmd, stage=label or "round")
         try:
-            r = subprocess.run(cmd, shell=True, cwd=str(run.repo),
-                               capture_output=True, text=True, timeout=timeout)
-            passed = r.returncode == 0
-            tail = (r.stdout + r.stderr)[-4000:]
-        except subprocess.TimeoutExpired:
-            passed = False
-            tail = f"command timed out after {timeout}s"
+            env = os.environ.copy()
+            env["REVIEW_LOOP_RUN_DIR"] = str(run.dir.resolve())
+            r, timed_out = _run_process_tree(
+                cmd, shell=True, cwd=run.repo, timeout=timeout, env=env,
+                output_limit=int(run.config.get("max_log_chars", 100_000)))
+            passed = r.returncode == 0 and not timed_out
+            output = r.stdout + r.stderr
+            if timed_out:
+                output += f"\ncommand timed out after {timeout}s"
+            tail = output[-4000:]
         except Exception as exc:  # a broken command must not kill the run
             passed = False
             tail = f"could not execute: {exc}"
@@ -1373,8 +2421,8 @@ Before finishing:
 3. Verify the requested behaviour actually works, not just that tests pass.
 4. Leave the repository in a working state.
 
-Do not modify anything inside the `.review-loop/` directory; it is orchestration
-state, not part of the project.
+Do not modify the directory named by `REVIEW_LOOP_RUN_DIR`; it is protected
+orchestration state outside the project.
 
 Finish with a short summary of what you changed and why.
 """
@@ -1503,59 +2551,224 @@ def load_persona(persona_id: str) -> str:
 # The loop
 # ---------------------------------------------------------------------------
 
+def _terminal_run_failure(config: dict[str, Any], repo: Path, state: Path,
+                          run_dir: Path, detail: str,
+                          stage: str = "orchestration",
+                          existing_run: Optional[Run] = None) -> int:
+    """Write the terminal contract even when normal orchestration unwinds."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run = existing_run or Run(repo, run_dir, config)
+    snapshot = run.snapshot
+    ledger = snapshot.get("ledger")
+    if not isinstance(ledger, Ledger):
+        ledger = Ledger()
+    stage = str(snapshot.get("stage") or stage) if existing_run else stage
+    run.emit("run_failed", stage=stage, error=detail[:1000])
+    try:
+        final = _write_final(
+            run, snapshot.get("base_sha"), "run_failed", ledger,
+            int(snapshot.get("rounds") or 0),
+            str(snapshot.get("validation_status") or VALIDATION_NOT_CONFIGURED),
+            set(config.get("blocking_severities") or ["blocker", "high", "medium"]),
+            str(snapshot.get("baseline_status") or VALIDATION_NOT_CONFIGURED),
+            list(snapshot.get("missing_reviewers") or []),
+            failure_stage=stage, failure_detail=detail,
+        )
+    except Exception as exc:
+        # Reporting must not repeat the exception that brought the loop here.
+        body = ("# Review loop result\n\n**Outcome: run_failed**\n\n"
+                f"- Failure stage: {stage}\n"
+                f"- Error: {detail}\n"
+                f"- Report fallback error: {type(exc).__name__}: {exc}\n")
+        final = run_dir / "final.md"
+        _safe_write_text(final, body)
+        try:
+            _safe_write_text(state / "final.md", body)
+        except OSError:
+            pass
+    validation_status = str(snapshot.get("validation_status") or VALIDATION_NOT_CONFIGURED)
+    run.emit("run_complete", outcome="run_failed",
+             rounds=int(snapshot.get("rounds") or 0), findings=len(ledger.entries),
+             resolved=len(ledger.resolved()),
+             blocking_open=len(ledger.open_findings()),
+             validation_status=validation_status,
+             validation_passed=validation_status == VALIDATION_PASSED,
+             missing_reviewers=list(snapshot.get("missing_reviewers") or []),
+             final=str(final), error=detail[:400])
+    return exit_code("run_failed")
+
+
+def _terminalize_handed_failure(config: dict[str, Any], state: Path,
+                                run_dir: Path, token: str, detail: str) -> int:
+    """Adopt a parent's reserved run when possible, then fail it terminally."""
+    raw_repo = config.get("repo")
+    if not isinstance(raw_repo, str):
+        return 1
+    repo = Path(raw_repo).expanduser().resolve()
+    if not repo.is_dir():
+        return 1
+    held = acquire_lock(state, token, os.getpid(), run_dir, adopt_only=True)
+    if held:
+        # Failed adoption is not authority to write a caller-selected path.
+        return 1
+    try:
+        return _terminal_run_failure(config, repo, state, run_dir, detail, "launch")
+    finally:
+        release_lock(state, run_dir)
+
 def cmd_run(args: argparse.Namespace) -> int:
-    config = json.loads(Path(args.config).read_text())
-    problems = validate_config(config)
-    repo = Path(config.get("repo") or os.getcwd()).resolve()
-    problems += preflight_repo(repo, config)
+    config_path = Path(args.config).expanduser().resolve()
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"error": "invalid config", "problems": [str(exc)]}, indent=2),
+              file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print(json.dumps({"error": "invalid config",
+                          "problems": ["run config must be a JSON object."]}, indent=2),
+              file=sys.stderr)
+        return 1
+    handed_over = (isinstance(config.get("run_dir"), str)
+                   and isinstance(config.get("lock_token"), str)
+                   and bool(config["run_dir"]) and bool(config["lock_token"]))
+    handed_run = Path(config["run_dir"]) if handed_over else None
+    # Only `start` may supply the paired internal handoff fields. A foreground
+    # run always mints a fresh secret; a stray/injected token can never become
+    # authority to adopt another process's lock.
+    token = config["lock_token"] if handed_over else new_lock_token()
+    repo, repo_problems = resolve_config_repo(config)
+    problems = validate_config(config) + repo_problems
+    state: Optional[Path] = None
+    handoff_authenticated = False
+    if repo is not None:
+        try:
+            state = state_for_repo(repo, config.get("_git_worktree"))
+            _ensure_state_ignored(state)
+        except (GitError, RuntimeError) as exc:
+            problems.append(str(exc))
+        if handed_over and handed_run is not None and state is not None:
+            expected_config = state / "history" / handed_run.name / "config.json"
+            try:
+                held_record = json.loads((state / "lock").read_text())
+                handoff_authenticated = (
+                    handed_run.absolute().parent.resolve() == (state / "history").resolve()
+                    and config_path == expected_config.resolve()
+                    and not stat.S_ISLNK(handed_run.lstat().st_mode)
+                    and held_record.get("token") == token
+                    and held_record.get("run_dir") == str(handed_run)
+                )
+            except (OSError, ValueError, AttributeError):
+                handoff_authenticated = False
+            if not handoff_authenticated:
+                problems.append("internal handoff fields do not match the canonical "
+                                "reserved run and live lock")
     if problems:
         print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
               file=sys.stderr)
+        if handed_run is not None and handoff_authenticated and state is not None:
+            return _terminalize_handed_failure(
+                config, state, handed_run, token, "; ".join(problems))
         return 1
-    state = repo / STATE_DIRNAME
-    _ensure_state_ignored(state)
+    assert repo is not None
+    assert state is not None
 
     # A `run_dir` in the config means `start` already reserved one and is
     # handing this process its lock; `lock_token` is the proof. Run directly
     # and we mint our own token, which no live lock can match.
-    handed_over = bool(config.get("run_dir"))
-    token = config.get("lock_token") or new_lock_token()
+    if not handed_over:
+        problems = preflight_repo(repo, config)
+        if problems:
+            print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
+                  file=sys.stderr)
+            return 1
 
     held = acquire_lock(state, token, os.getpid(),
-                        Path(config["run_dir"]) if handed_over else None,
+                        handed_run,
                         adopt_only=handed_over)
     if held:
         print(json.dumps({"error": "run already active", "problems": [held]}, indent=2),
               file=sys.stderr)
         return 1
 
-    run_dir = Path(config["run_dir"]) if handed_over else _new_run_dir(state)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    # The lock is keyed on the run directory from here on, so release can tell
-    # our lock from a later run's.
-    handoff_lock(state, token, os.getpid(), run_dir)
+    run_dir = handed_run
     try:
-        return _run_loop(config, repo, state, run_dir)
+        if handed_over:
+            problems = preflight_repo(repo, config)
+            if problems:
+                print(json.dumps({"error": "invalid config", "problems": problems},
+                                 indent=2), file=sys.stderr)
+                assert run_dir is not None
+                return _terminal_run_failure(
+                    config, repo, state, run_dir, "; ".join(problems), "preflight")
+        if run_dir is None:
+            run_dir = _new_run_dir(state)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # The lock is keyed on the run directory from here on, so release can
+        # tell our lock from a later run's.
+        handoff_lock(state, token, os.getpid(), run_dir)
+        run_obj = Run(repo, run_dir, config)
+        try:
+            return _run_loop(config, repo, state, run_dir, run_obj)
+        except Exception as exc:
+            # A detached caller only has the event stream and final report.
+            # Never leave it polling forever because an unanticipated error
+            # escaped the normal stage-specific failure handling.
+            detail = f"{type(exc).__name__}: {exc}"
+            return _terminal_run_failure(config, repo, state, run_dir, detail,
+                                         existing_run=run_obj)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        if run_dir is None:
+            failure_name = f"run-failed-{os.getpid()}-{secrets.token_hex(4)}"
+            report_errors: list[str] = []
+            for candidate in (state / "history" / failure_name,
+                              state / failure_name):
+                try:
+                    candidate.mkdir(parents=True, exist_ok=False)
+                    run_dir = candidate
+                    break
+                except OSError as fallback_exc:
+                    report_errors.append(
+                        f"{type(fallback_exc).__name__}: {fallback_exc}")
+            else:
+                print(json.dumps({
+                    "error": "run_failed",
+                    "stage": "launch",
+                    "detail": detail,
+                    "report_errors": report_errors,
+                }, indent=2), file=sys.stderr)
+                return exit_code("run_failed")
+            handoff_lock(state, token, os.getpid(), run_dir)
+        return _terminal_run_failure(config, repo, state, run_dir, detail)
     finally:
-        release_lock(state, run_dir)
+        if run_dir is not None:
+            release_lock(state, run_dir)
+        # If normal and emergency run-directory creation both failed, the lock
+        # never acquired a run_dir. This is harmless after a successful token
+        # rotation and essential on the pre-handoff failure path.
+        release_starting_lock(state, token)
 
 
-def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) -> int:
-    run = Run(repo, run_dir, config)
+def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
+              run: Optional[Run] = None) -> int:
+    run = run or Run(repo, run_dir, config)
 
-    (run_dir / "config.json").write_text(json.dumps(config, indent=2))
-    (state / "task.md").write_text(config["task"])
+    _safe_write_text(run_dir / "config.json", json.dumps(config, indent=2))
+    _safe_write_text(state / "task.md", config["task"])
     # `start` writes this too, but a foreground `run` is a first-class entry
     # point and `render`/`status` resolve through it — without this they would
     # report on whichever run was started last.
-    (state / "current-run").write_text(str(run_dir))
-    (run_dir / "pid").write_text(str(os.getpid()))
+    _safe_write_text(state / "current-run", str(run_dir))
+    _safe_write_text(run_dir / "pid", str(os.getpid()))
 
     task = config["task"]
     blocking = set(config.get("blocking_severities") or ["blocker", "high", "medium"])
     max_iter = int(config.get("max_iterations", 5))
 
-    base_sha = base_commit(repo)
+    base_sha = base_commit(repo, allow_non_git=bool(config.get("allow_non_git")),
+                           git_worktree=config.get("_git_worktree"))
+    run.snapshot.update({"base_sha": base_sha, "stage": "baseline"})
     if base_sha is None:
         run.emit("warning", message="Repository has no commits; reviewing the whole working tree.")
     run.emit("run_start", repo=str(repo), base_sha=base_sha,
@@ -1565,16 +2778,23 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
     # --- baseline: was validation already failing before we touched it? ----
     # Without this the loop cannot tell "the change broke the build" from "the
     # build was broken when we arrived", and every later result is ambiguous.
+    baseline_before = worktree_fingerprint(repo, config)
     baseline_status, baseline_results = run_validation(run, label="baseline")
-    (run_dir / "validation-00.json").write_text(json.dumps(
+    run.snapshot["baseline_status"] = baseline_status
+    _safe_write_text(run_dir / "validation-00.json", json.dumps(
         {"stage": "baseline", "status": baseline_status, "results": baseline_results}, indent=2))
+    if worktree_fingerprint(repo, config) != baseline_before:
+        raise RuntimeError(
+            "worktree changed while baseline validation was running; its result "
+            "does not describe a stable filesystem snapshot"
+        )
     run.emit("baseline_validation", status=baseline_status,
              commands=len(baseline_results))
     if baseline_status == VALIDATION_FAILED:
         run.emit("warning", message="Validation was already failing before the task "
                                     "started; the independent gate cannot attribute a "
                                     "later failure to this change.")
-        if config.get("require_clean_baseline"):
+        if config.get("require_clean_baseline", True):
             final = _write_final(run, base_sha, "baseline_failed", Ledger(), 0,
                                  VALIDATION_FAILED, blocking, baseline_status)
             run.emit("run_complete", outcome="baseline_failed", rounds=0, findings=0,
@@ -1595,6 +2815,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
                       "which failures pre-existed.\n"
                       + _validation_note(baseline_status, baseline_results))
 
+    run.snapshot["stage"] = "implement"
     ok, text = invoke_agent(run, config["implementer"],
                             IMPLEMENTER_PROMPT.format(task=task, validation_note=gate_note),
                             readonly=False, label="Implementer",
@@ -1610,10 +2831,11 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
                  blocking_open=0, validation_status=VALIDATION_NOT_CONFIGURED,
                  final=str(final), error=text[:400])
         return exit_code("implementer_failed")
-    (run_dir / "implementer-00.md").write_text(text)
+    _safe_write_text(run_dir / "implementer-00.md", text)
 
     outcome = "max_iterations_reached"
     ledger = Ledger()
+    run.snapshot["ledger"] = ledger
     rounds_run = 0
     val_status = VALIDATION_NOT_CONFIGURED
     missing_reviewers: list[str] = []
@@ -1625,14 +2847,25 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
             outcome = "stopped_by_user"
             break
         rounds_run = iteration
+        run.snapshot.update({"rounds": iteration, "stage": "validation"})
 
         run.emit("iteration_start", iteration=iteration)
 
         # --- independent gate: tests decide, not model consensus -----------
+        validation_before = worktree_fingerprint(repo, config)
         val_status, val_results = run_validation(run)
+        run.snapshot["validation_status"] = val_status
         val_ok = val_status == VALIDATION_PASSED
-        (run_dir / f"validation-{iteration:02d}.json").write_text(json.dumps(val_results, indent=2))
+        _safe_write_text(run_dir / f"validation-{iteration:02d}.json",
+                         json.dumps(val_results, indent=2))
 
+        reviewed_fingerprint = worktree_fingerprint(repo, config)
+        if reviewed_fingerprint != validation_before:
+            raise RuntimeError(
+                "worktree changed while validation was running; the validation "
+                "result does not cover the reviewed filesystem snapshot"
+            )
+        run.snapshot["stage"] = "diff_collection"
         diff, manifest = collect_diff(repo, base_sha, config)
         if not diff.strip():
             run.emit("warning", message="Diff is empty; implementer may not have changed anything.")
@@ -1676,9 +2909,17 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
             return rv, ok_, text_
 
         reviewers = config["reviewers"]
-        workers = len(reviewers) if config.get("parallel", True) else 1
+        workers = min(len(reviewers), MAX_AGENT_WORKERS) \
+            if config.get("parallel", True) else 1
+        run.snapshot["stage"] = "review"
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             results = list(pool.map(do_review, reviewers))
+
+        if worktree_fingerprint(repo, config) != reviewed_fingerprint:
+            raise RuntimeError(
+                "worktree changed after validation/diff collection while reviewers "
+                "were running; approval is invalid and the run failed closed"
+            )
 
         round_findings: list[dict[str, Any]] = []
         missing_reviewers = []
@@ -1708,9 +2949,9 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
             # Findings from a malformed review are still kept: they can only
             # make the gate stricter, and the slot is already counted missing.
             found = normalise_findings(slot, obj)
-            (run_dir / f"review-{iteration:02d}-{slot}.json").write_text(
-                json.dumps(obj if isinstance(obj, dict) else
-                           {"verdict": "unparsed", "findings": []}, indent=2))
+            _safe_write_text(run_dir / f"review-{iteration:02d}-{slot}.json",
+                             json.dumps(obj if isinstance(obj, dict) else
+                                        {"verdict": "unparsed", "findings": []}, indent=2))
             counts = {s: sum(1 for x in found if x["severity"] == s) for s in SEVERITIES}
             run.emit("review_done", reviewer=slot,
                      label=rv.get("label") or slot,
@@ -1718,12 +2959,14 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
                      usable=not problem,
                      counts={k: v for k, v in counts.items() if v})
             round_findings += found
+        run.snapshot["missing_reviewers"] = list(missing_reviewers)
 
         panel_complete = not missing_reviewers
         merged = dedupe(round_findings)
-        (run_dir / f"findings-{iteration:02d}.json").write_text(json.dumps(merged, indent=2))
+        _safe_write_text(run_dir / f"findings-{iteration:02d}.json",
+                         json.dumps(merged, indent=2))
         ledger.record_round(iteration, merged, panel_complete=panel_complete)
-        (run_dir / "ledger.json").write_text(json.dumps(ledger.to_json(), indent=2))
+        _safe_write_text(run_dir / "ledger.json", json.dumps(ledger.to_json(), indent=2))
 
         blockers = [f for f in merged if f["severity"] in blocking]
         run.emit("round_summary", iteration=iteration, total=len(merged),
@@ -1774,6 +3017,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
         payload = json.dumps(blockers or merged, indent=2)
         if not val_ok:
             payload += "\n\nVALIDATION FAILURES:\n" + implementer_validation_note
+        run.snapshot["stage"] = "fix"
         ok, text = invoke_agent(run, config["implementer"],
                                 FIX_PROMPT.format(task=task, count=len(reviewers),
                                                   reviews=payload),
@@ -1783,7 +3027,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
             run.emit("run_failed", stage="fix", error=text)
             outcome = "implementer_failed"
             break
-        (run_dir / f"implementer-{iteration:02d}.md").write_text(text)
+        _safe_write_text(run_dir / f"implementer-{iteration:02d}.md", text)
 
     open_now = ledger.open_findings()
     final = _write_final(run, base_sha, outcome, ledger, rounds_run,
@@ -1802,7 +3046,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path) ->
 
 
 def _validation_note(status: str, results: list[dict[str, Any]],
-                     brief: bool = False, baseline: str | None = None) -> str:
+                     brief: bool = False, baseline: Optional[str] = None) -> str:
     """Summarise validation.
 
     `brief` is for reviewers, who need to know whether the suite passes but
@@ -1834,7 +3078,10 @@ def _new_run_dir(state: Path) -> Path:
     """
     history = state / "history"
     history.mkdir(parents=True, exist_ok=True)
-    n = len([d for d in history.iterdir() if d.is_dir()]) + 1
+    entries = list(history.iterdir())
+    if any(stat.S_ISLNK(entry.lstat().st_mode) for entry in entries):
+        raise RuntimeError(f"unsafe symlink in review-loop history: {history}")
+    n = len([d for d in entries if stat.S_ISDIR(d.lstat().st_mode)]) + 1
     while True:
         candidate = history / f"run-{n:02d}"
         try:
@@ -1855,6 +3102,7 @@ EXIT_CODES = {
     "approved_unverified": 0,
     "implementer_failed": 1,
     "baseline_failed": 1,
+    "run_failed": 1,
 }
 
 
@@ -1875,14 +3123,17 @@ OUTCOME_NOTE = {
                                  "were configured, so there was no independent gate and the "
                                  "loop will not call this approved. Add validation commands "
                                  "and re-run.",
-    "baseline_failed": "Validation was already failing before the task started, and "
-                       "`require_clean_baseline` was set. Fix the build first, or the "
-                       "gate cannot attribute anything to this change.",
+    "baseline_failed": "Validation was already failing before the task started. A clean "
+                       "baseline is required by default so the task cannot silently grow. "
+                       "Fix the build first, or explicitly set `require_clean_baseline: "
+                       "false` for a task whose purpose includes repairing it.",
     "max_iterations_reached": "The loop hit its iteration cap with blocking findings "
                               "still open. This needs a human — do not simply raise the cap.",
     "stopped_by_user": "Stopped on request. The working tree holds whatever the last "
                        "completed step produced.",
     "implementer_failed": "The build agent could not complete a fix round. See logs/.",
+    "run_failed": "The orchestrator encountered an unexpected error and failed closed. "
+                  "See the run event stream and logs for the recorded error.",
     "no_progress": "A fix round changed nothing the reviewers cared about, so the loop "
                    "stopped rather than spending another panel on the same answer. "
                    "The findings below need a human.",
@@ -1896,10 +3147,12 @@ VALIDATION_LABEL = {
 }
 
 
-def _write_final(run: Run, base_sha: str | None, outcome: str,
+def _write_final(run: Run, base_sha: Optional[str], outcome: str,
                  ledger: Ledger, rounds: int, validation_status: str,
                  blocking: set[str], baseline_status: str = VALIDATION_NOT_CONFIGURED,
-                 missing_reviewers: list[str] | None = None) -> Path:
+                 missing_reviewers: Optional[list[str]] = None,
+                 failure_stage: Optional[str] = None,
+                 failure_detail: Optional[str] = None) -> Path:
     open_findings = ledger.open_findings()
     resolved = ledger.resolved()
     blockers = [f for f in open_findings if f["severity"] in blocking]
@@ -1921,6 +3174,10 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
         f"- Blocking findings open: {len(blockers)}",
         f"- Advisory findings open: {len(advisory)}", "",
     ]
+    if failure_stage or failure_detail:
+        lines += ["## Failure", "",
+                  f"- Stage: {failure_stage or 'unknown'}",
+                  f"- Detail: {failure_detail or 'unavailable'}", ""]
     if missing_reviewers:
         lines += [f"> **Panel incomplete.** These reviewers contributed nothing in the "
                   f"final round: {', '.join(missing_reviewers)}. Their areas of the "
@@ -1970,8 +3227,10 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
 
     body = "\n".join(lines)
     path = run.dir / "final.md"
-    path.write_text(body)
-    (run.repo / STATE_DIRNAME / "final.md").write_text(body)
+    _safe_write_text(path, body)
+    state = _state_for_run(run.dir)
+    if state is not None:
+        _safe_write_text(state / "final.md", body)
     return path
 
 
@@ -1981,18 +3240,36 @@ def _write_final(run: Run, base_sha: str | None, outcome: str,
 
 def cmd_start(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
-    config = json.loads(config_path.read_text())
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"error": "invalid config", "problems": [str(exc)]}, indent=2),
+              file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print(json.dumps({"error": "invalid config",
+                          "problems": ["run config must be a JSON object."]}, indent=2),
+              file=sys.stderr)
+        return 1
     # Validate before detaching: a config error must surface here, where the
     # caller can still see it, not in a log file nobody is watching.
     problems = validate_config(config)
-    repo = Path(config.get("repo") or os.getcwd()).resolve()
-    problems += preflight_repo(repo, config)
+    repo, repo_problems = resolve_config_repo(config)
+    problems += repo_problems
+    if repo is not None:
+        problems += preflight_repo(repo, config)
     if problems:
         print(json.dumps({"error": "invalid config", "problems": problems}, indent=2),
               file=sys.stderr)
         return 1
-    state = repo / STATE_DIRNAME
-    _ensure_state_ignored(state)
+    assert repo is not None
+    try:
+        state = state_for_repo(repo, config.get("_git_worktree"))
+        _ensure_state_ignored(state)
+    except (GitError, RuntimeError) as exc:
+        print(json.dumps({"error": "unsafe state", "problems": [str(exc)]}, indent=2),
+              file=sys.stderr)
+        return 1
 
     # Claim the worktree before reserving a run directory or repointing
     # `current-run`, so a second `start` cannot detach a run that would fight
@@ -2004,65 +3281,152 @@ def cmd_start(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
-    run_dir = _new_run_dir(state)
-    config["run_dir"] = str(run_dir)
-    config["lock_token"] = token
-    resolved = run_dir / "config.json"
-    resolved.write_text(json.dumps(config, indent=2))
-
-    log = (run_dir / "run.log").open("w")
+    run_dir: Optional[Path] = None
+    proc: Optional[subprocess.Popen] = None
+    log = None
     try:
+        run_dir = _new_run_dir(state)
+        config["run_dir"] = str(run_dir)
+        config["lock_token"] = token
+        resolved = run_dir / "config.json"
+        _safe_write_text(resolved, json.dumps(config, indent=2))
+        log = (run_dir / "run.log").open("w")
         proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "run", "--config", str(resolved)],
             cwd=str(repo), stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    except Exception:
-        handoff_lock(state, token, os.getpid(), run_dir)
-        release_lock(state, run_dir)
-        raise
-    # Name the child on the lock so the window between this process exiting and
-    # the child adopting does not look like a crashed run to the next caller.
-    handoff_lock(state, token, proc.pid, run_dir)
-    (run_dir / "pid").write_text(str(proc.pid))
-    (state / "current-run").write_text(str(run_dir))
-    print(json.dumps({"run_dir": str(run_dir), "pid": proc.pid,
-                      "progress": str(run_dir / "progress.jsonl")}, indent=2))
-    return 0
+        # Name the child on the lock so the window between this process exiting
+        # and the child adopting does not look like a crashed run to the next caller.
+        handoff_lock(state, token, proc.pid, run_dir)
+        _safe_write_text(run_dir / "pid", str(proc.pid))
+        _safe_write_text(state / "current-run", str(run_dir))
+        print(json.dumps({"run_dir": str(run_dir), "pid": proc.pid,
+                          "progress": str(run_dir / "progress.jsonl")}, indent=2))
+        return 0
+    except Exception as exc:
+        if run_dir is not None:
+            _terminate_marked_processes(run_dir, grace=0.5)
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        if run_dir is None:
+            release_starting_lock(state, token)
+        else:
+            handoff_lock(state, token, os.getpid(), run_dir)
+            terminal = False
+            try:
+                if (run_dir / "progress.jsonl").exists():
+                    terminal = any(
+                        json.loads(line).get("event") == "run_complete"
+                        for line in (run_dir / "progress.jsonl").read_text().splitlines()
+                        if line.strip()
+                    )
+            except (OSError, ValueError, AttributeError):
+                terminal = False
+            if not terminal:
+                try:
+                    _terminal_run_failure(
+                        config, repo, state, run_dir,
+                        f"{type(exc).__name__}: {exc}", "launch")
+                except Exception as report_exc:
+                    print(json.dumps({
+                        "error": "could not write terminal launch report",
+                        "detail": f"{type(report_exc).__name__}: {report_exc}",
+                    }), file=sys.stderr)
+            release_lock(state, run_dir)
+            release_starting_lock(state, token)
+        print(json.dumps({"error": "could not launch run", "detail": str(exc)}),
+              file=sys.stderr)
+        return 1
+    finally:
+        if log is not None:
+            log.close()
 
 
-def _ensure_state_ignored(state: Path) -> None:
-    """Make the state directory invisible to git without touching the repo.
-
-    Appending to the project's own `.gitignore` would leave an uncommitted
-    change behind — which the next run's dirty-tree check would then refuse to
-    start on, and which the user never asked for. A `.gitignore` holding `*`
-    inside the directory ignores the directory's contents and itself, so
-    `git status` stays clean and nothing outside `.review-loop/` is modified.
-    """
-    try:
-        state.mkdir(exist_ok=True)
-        marker = state / ".gitignore"
-        if not marker.exists():
-            marker.write_text("# review-loop working state; not part of the project\n*\n")
-    except Exception:
-        pass
-
-
-def _resolve_run(args: argparse.Namespace) -> Path | None:
+def _resolve_run(args: argparse.Namespace) -> Optional[Path]:
     if getattr(args, "run", None):
-        return Path(args.run)
-    repo = Path(getattr(args, "repo", None) or os.getcwd())
-    state = repo / STATE_DIRNAME
+        candidate = Path(args.run).expanduser()
+        try:
+            return _validated_run_dir(candidate, getattr(args, "repo", None))
+        except RuntimeError:
+            return None
+    configured = Path(getattr(args, "repo", None) or os.getcwd())
+    try:
+        repo = canonical_worktree_root(configured, allow_non_git=True)
+    except (OSError, RuntimeError):
+        repo = configured.expanduser().resolve()
+    try:
+        state = state_for_repo(repo, None)
+        _ensure_state_ignored(state)
+    except (GitError, RuntimeError):
+        return None
     pointer = state / "current-run"
     if pointer.exists():
-        return Path(pointer.read_text().strip())
+        try:
+            return _validated_run_dir(Path(pointer.read_text().strip()), str(repo))
+        except RuntimeError:
+            return None
     history = state / "history"
     if history.exists():
-        dirs = sorted([d for d in history.iterdir() if d.is_dir()])
+        dirs = sorted([d for d in history.iterdir()
+                       if not stat.S_ISLNK(d.lstat().st_mode) and d.is_dir()])
         if dirs:
-            return dirs[-1]
+            try:
+                return _validated_run_dir(dirs[-1], str(repo))
+            except RuntimeError:
+                return None
     return None
+
+
+def _validated_run_dir(candidate: Path, repo_hint: Optional[str] = None) -> Path:
+    """Authenticate an explicit run path before any read, write, or signal."""
+    absolute = candidate.absolute()
+    if not os.path.lexists(str(absolute)) or stat.S_ISLNK(absolute.lstat().st_mode) \
+            or not absolute.is_dir():
+        raise RuntimeError("run directory is missing, symlinked, or not a directory")
+    config_path = absolute / "config.json"
+    try:
+        mode = config_path.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError("run directory has no owned config.json") from exc
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise RuntimeError("run config is not a regular file")
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("run config is unreadable") from exc
+    raw_repo = repo_hint or config.get("repo")
+    if not isinstance(raw_repo, str):
+        raise RuntimeError("run config has no repository identity")
+    repo = canonical_worktree_root(Path(raw_repo), allow_non_git=True)
+    git_worktree = config.get("_git_worktree")
+    state = state_for_repo(repo, git_worktree)
+    _ensure_state_ignored(state)
+    history = state / "history"
+    if absolute.resolve().parent != history.resolve() or not re.fullmatch(
+            r"run-[0-9]+|run-failed-[A-Za-z0-9-]+", absolute.name):
+        raise RuntimeError("run directory is outside the canonical state history")
+    if config_path.resolve() != (absolute / "config.json").resolve():
+        raise RuntimeError("run config does not belong to this run")
+    for reserved in ("progress.jsonl", "final.md", "STOP", "pid"):
+        child = absolute / reserved
+        if os.path.lexists(str(child)) and stat.S_ISLNK(child.lstat().st_mode):
+            raise RuntimeError(f"unsafe symlink in run directory: {reserved}")
+    return absolute.resolve()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2078,14 +3442,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 events.append(json.loads(line))
             except Exception:
                 continue
-    running = False
-    pid_file = run_dir / "pid"
-    if pid_file.exists():
-        try:
-            os.kill(int(pid_file.read_text().strip()), 0)
-            running = True
-        except Exception:
-            running = False
+    pid = _locked_run_pid(run_dir)
+    running = pid is not None and _pid_is_review_loop(pid, run_dir)
     print(json.dumps({"run_dir": str(run_dir), "running": running,
                       "events": events[-args.tail:]}, indent=2))
     return 0
@@ -2257,7 +3615,6 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not run_dir:
         print(json.dumps({"error": "no run found"}))
         return 1
-    (run_dir / "STOP").write_text("stop")
     if args.kill:
         pid = _locked_run_pid(run_dir)
         if pid is None or not _pid_is_review_loop(pid, run_dir):
@@ -2267,8 +3624,41 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 "hint": "The run is not actively locked by a matching review-loop process."
             }), file=sys.stderr)
             return 1
+    else:
+        # Even a cooperative stop is a write. Require a live authenticated
+        # lock so an explicit --run path cannot redirect it through a planted
+        # file or a historical run.
+        pid = _locked_run_pid(run_dir)
+        if pid is None or not _pid_is_review_loop(pid, run_dir):
+            print(json.dumps({"error": "run is not actively owned",
+                              "run_dir": str(run_dir)}), file=sys.stderr)
+            return 1
+    _safe_write_text(run_dir / "STOP", "stop")
+    if args.kill:
+        remaining = _terminate_marked_processes(run_dir)
+        if remaining:
+            print(json.dumps({
+                "error": "could not stop active command tree",
+                "run_dir": str(run_dir),
+                "remaining_pids": sorted(remaining),
+            }), file=sys.stderr)
+            return 1
+        current_pid = _locked_run_pid(run_dir)
+        if current_pid is None:
+            # Stopping the active command can let the orchestrator observe STOP
+            # and finish normally. Its old PID is no longer authority to signal.
+            print(json.dumps({"stopping": str(run_dir)}))
+            return 0
+        if current_pid != pid or not _pid_is_review_loop(current_pid, run_dir):
+            print(json.dumps({
+                "error": "run identity changed while stopping",
+                "run_dir": str(run_dir),
+            }), file=sys.stderr)
+            return 1
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            # The lock authenticates exactly one orchestrator PID, never its
+            # shell/CI process group. Active command trees were drained above.
+            os.kill(current_pid, signal.SIGTERM)
         except Exception as exc:
             print(json.dumps({"error": "could not stop run", "detail": str(exc)}),
                   file=sys.stderr)
