@@ -206,7 +206,7 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "efforts": CLAUDE_EFFORTS,
         "default_effort": "high",
         "default_model": "opus",
-        "reviewer_default_effort": "high",
+        "reviewer_default_effort": "low",
         "reviewer_default_model": "opus",
         "reads_out_file": False,
         "config_dir_env": "CLAUDE_CONFIG_DIR",

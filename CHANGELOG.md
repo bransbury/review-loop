@@ -11,6 +11,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Default non-Claude builders to GPT-5.6 Sol at medium effort and reviewers to
   GPT-5.6 Luna at xhigh effort, with availability-aware model fallback.
+- Default Claude reviewers to the rolling Opus alias at low effort while
+  retaining Opus at high effort for the builder.
 - Document how to update installer, clone, copy, and plugin-based skill
   installations and reload each host afterward.
 

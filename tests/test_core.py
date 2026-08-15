@@ -1042,6 +1042,10 @@ class ReadOnlyEnforcement(unittest.TestCase):
 
 
 class RoleSpecificDefaults(unittest.TestCase):
+    def test_claude_uses_opus_high_for_builder_and_low_for_review(self):
+        self.assertEqual(_role_defaults("claude", False), ("opus", "high"))
+        self.assertEqual(_role_defaults("claude", True), ("opus", "low"))
+
     def test_codex_uses_sol_medium_for_builder_and_luna_xhigh_for_review(self):
         models = ["gpt-5.6-sol", "gpt-5.6-luna"]
         with patch("review_loop._codex_models", return_value=models):
@@ -1071,7 +1075,13 @@ class RoleSpecificDefaults(unittest.TestCase):
              patch("review_loop._copilot_models", return_value=["auto"]), \
              redirect_stdout(output):
             self.assertEqual(cmd_detect(types.SimpleNamespace()), 0)
-        codex = json.loads(output.getvalue())["agents"]["codex"]
+        agents = json.loads(output.getvalue())["agents"]
+        claude = agents["claude"]
+        self.assertEqual(claude["implementer_default"],
+                         {"model": "opus", "effort": "high"})
+        self.assertEqual(claude["reviewer_default"],
+                         {"model": "opus", "effort": "low"})
+        codex = agents["codex"]
         self.assertEqual(codex["implementer_default"],
                          {"model": "gpt-5.6-sol", "effort": "medium"})
         self.assertEqual(codex["reviewer_default"],

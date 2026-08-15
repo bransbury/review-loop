@@ -84,7 +84,7 @@ Two or three reviewers is the useful range. More than four mostly produces dupli
 
 The same persona may appear twice on different models — that is a legitimate way to get two independent opinions from one lens, and the orchestrator gives each slot its own identity so they can corroborate each other.
 
-**Question 3 — Model and effort per reviewer.** Let the user override each reviewer individually. In non-Claude hosts, default every reviewer to GPT-5.6 Luna at `xhigh` when `detect` reports it; otherwise use that harness's detected reviewer fallback. In Claude Code, retain the detected Claude default. Reviewers benefit from more effort than the implementer: they get one pass and no feedback.
+**Question 3 — Model and effort per reviewer.** Let the user override each reviewer individually. In Claude Code, default every reviewer to the rolling Opus alias at `low`. In non-Claude hosts, default every reviewer to GPT-5.6 Luna at `xhigh` when `detect` reports it; otherwise use that harness's detected reviewer fallback.
 
 **Question 4 — Mixing (only if `detect` found more than one CLI).** Default is no. If the user opts in, re-ask question 3 with models from every detected CLI, labelled by which one they come from. Cross-family reviewers disagree more usefully than same-family ones, which is the main reason to bother.
 
@@ -120,7 +120,7 @@ Config shape:
   "implementer": { "cli": "claude", "model": "opus", "effort": "high" },
   "reviewers": [
     { "persona": "principal-engineer", "label": "Principal Engineer",
-      "cli": "claude", "model": "opus", "effort": "max" },
+      "cli": "claude", "model": "opus", "effort": "low" },
     { "persona": "adversarial-qa", "label": "Adversarial QA",
       "cli": "codex", "model": "gpt-5.6-luna", "effort": "xhigh" }
   ]

@@ -143,7 +143,8 @@ You will be asked five things:
      adversarial-qa       <- always recommended
      security             <- task mentions login, oauth, sso
    ```
-3. **Model and effort per reviewer** — each one independently. Non-Claude hosts
+3. **Model and effort per reviewer** — each one independently. Claude hosts
+   default reviewers to the latest Opus model at low effort; non-Claude hosts
    default reviewers to GPT-5.6 Luna at xhigh when available. The same persona
    may appear twice on different models; each slot keeps its own identity and
    they can corroborate each other.
@@ -159,7 +160,7 @@ Then it runs detached and reports progress:
   ✓ 47 tests passed
 
 ● Review round 1
-  ├─ Principal Engineer — Opus @ max
+  ├─ Principal Engineer — Opus @ low
   │  1 high, 2 medium
   └─ Adversarial QA — GPT-5.6-Luna @ xhigh
      1 blocker, 1 medium
