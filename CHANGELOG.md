@@ -5,6 +5,17 @@ All notable changes to review-loop are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Default non-Claude builders to GPT-5.6 Sol at medium effort and reviewers to
+  GPT-5.6 Luna at xhigh effort, with availability-aware model fallback.
+- Default Claude reviewers to the rolling Opus alias at low effort while
+  retaining Opus at high effort for the builder.
+- Document how to update installer, clone, copy, and plugin-based skill
+  installations and reload each host afterward.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added
