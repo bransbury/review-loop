@@ -206,6 +206,8 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "efforts": CLAUDE_EFFORTS,
         "default_effort": "high",
         "default_model": "opus",
+        "reviewer_default_effort": "high",
+        "reviewer_default_model": "opus",
         "reads_out_file": False,
         "config_dir_env": "CLAUDE_CONFIG_DIR",
     },
@@ -213,8 +215,11 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "bin": "copilot",
         "argv": _copilot_argv,
         "efforts": COPILOT_EFFORTS,
-        "default_effort": "high",
-        "default_model": "auto",
+        "default_effort": "medium",
+        "default_model": "gpt-5.6-sol",
+        "reviewer_default_effort": "xhigh",
+        "reviewer_default_model": "gpt-5.6-luna",
+        "unavailable_model_fallback": "auto",
         "reads_out_file": False,
         "config_dir_env": None,
     },
@@ -222,12 +227,36 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "bin": "codex",
         "argv": _codex_argv,
         "efforts": CODEX_EFFORTS,
-        "default_effort": "high",
+        "default_effort": "medium",
         "default_model": "gpt-5.6-sol",
+        "reviewer_default_effort": "xhigh",
+        "reviewer_default_model": "gpt-5.6-luna",
         "reads_out_file": True,
         "config_dir_env": "CODEX_HOME",
     },
 }
+
+
+def _available_models(cli: str) -> list[str]:
+    if cli == "claude":
+        return CLAUDE_MODELS
+    if cli == "codex":
+        return _codex_models()
+    if cli == "copilot":
+        return _copilot_models()
+    return []
+
+
+def _role_defaults(cli: str, readonly: bool) -> tuple[str, str]:
+    """Resolve role-specific defaults without selecting an unavailable model."""
+    ad = ADAPTERS[cli]
+    model_key = "reviewer_default_model" if readonly else "default_model"
+    effort_key = "reviewer_default_effort" if readonly else "default_effort"
+    preferred_model = ad[model_key]
+    models = _available_models(cli)
+    if preferred_model not in models:
+        preferred_model = ad.get("unavailable_model_fallback") or (models[0] if models else preferred_model)
+    return preferred_model, ad[effort_key]
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +294,23 @@ def cmd_detect(_args: argparse.Namespace) -> int:
         path = shutil.which(ad["bin"])
         if not path:
             continue
+        implementer_model, implementer_effort = _role_defaults(name, False)
+        reviewer_model, reviewer_effort = _role_defaults(name, True)
         entry = {
             "path": path,
             "efforts": ad["efforts"],
-            "default_model": ad["default_model"],
-            "default_effort": ad["default_effort"],
+            # Keep the original fields as implementer-default aliases for
+            # hosts that have not yet learned the role-specific shape.
+            "default_model": implementer_model,
+            "default_effort": implementer_effort,
+            "implementer_default": {
+                "model": implementer_model,
+                "effort": implementer_effort,
+            },
+            "reviewer_default": {
+                "model": reviewer_model,
+                "effort": reviewer_effort,
+            },
         }
         if name == "claude":
             entry["models"] = CLAUDE_MODELS
@@ -1185,10 +1226,13 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
     log_file = run.dir / "logs" / f"{log_name}.log"
     log_file.parent.mkdir(exist_ok=True)
 
+    default_model, default_effort = _role_defaults(cli, readonly)
+    model = slot.get("model") or default_model
+    effort = slot.get("effort") or default_effort
     argv, stdin_text = ad["argv"](
         prompt,
-        slot.get("model") or ad["default_model"],
-        slot.get("effort") or ad["default_effort"],
+        model,
+        effort,
         readonly,
         run.config.get("permission_mode", "acceptEdits"),
         out_file,
@@ -1209,7 +1253,7 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
 
     started = time.time()
     run.emit("agent_start", label=label, cli=cli,
-             model=slot.get("model"), effort=slot.get("effort"), readonly=readonly)
+             model=model, effort=effort, readonly=readonly)
 
     timeout = int(run.config.get("agent_timeout_seconds", 3600))
     proc, timed_out = _run_process_tree(

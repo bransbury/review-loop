@@ -71,24 +71,30 @@ installer safely updates installations it recognizes. If a destination named
 `review-loop` already exists but is not a review-loop installation, the
 installer stops without deleting or replacing it.
 
-## Update
+## Update skill
 
-How to update depends on how review-loop was installed:
+Use the update method that matches how you installed review-loop.
 
-| Installation | Update command |
+| Installation method | Update command |
 |---|---|
-| One-line installer | Re-run the `curl` installation command above. |
-| Cloned, default symlink | Run `git pull --ff-only` in the clone. |
-| Cloned with `--copy` | Pull the clone, then run `./install.sh --copy` again. |
-| Claude Code plugin | `claude plugin update review-loop@review-loop` |
-| Copilot CLI plugin | `copilot plugin update review-loop` |
+| One-line installer | Re-run the one-line installation command in [Install](#install) |
+| Cloned with the default symlink | Run `git pull --ff-only` in the review-loop clone |
+| Cloned with `--copy` | Pull the clone, then run `./install.sh --copy` again |
+| Claude Code plugin | Run `claude plugin update review-loop@review-loop` |
+| Copilot CLI plugin | Run `copilot plugin update review-loop` |
 
-Restart the CLI after updating. Claude Code can instead run
-`/reload-plugins`. Third-party Claude marketplaces do not enable automatic
-updates by default; enable auto-update for the marketplace in `/plugin` if you
-want updates at startup.
+Default installer and clone-based installations use symlinks, so pulling the
+source checkout updates every linked harness immediately. Copy-based installs
+need `./install.sh --copy` after every pull. If the checkout has local changes,
+commit or stash them before pulling so Git does not overwrite your work.
 
-To see the installed orchestrator version:
+After updating, restart the CLI or start a new Codex task so the refreshed
+skill instructions are loaded. Claude Code can instead run `/reload-plugins`.
+Third-party Claude marketplaces do not enable automatic updates by default;
+enable auto-update for the marketplace in `/plugin` if you want updates at
+startup.
+
+Confirm the installed orchestrator version with:
 
 ```bash
 python3 <skill-dir>/scripts/review_loop.py --version
@@ -126,7 +132,8 @@ distribution. There is nothing to `pip install`.
 
 You will be asked five things:
 
-1. **Build agent** — which model and effort implements the task.
+1. **Build agent** — which model and effort implements the task. Non-Claude
+   hosts default to GPT-5.6 Sol at medium when available.
 2. **Reviewers** — pre-selected for you. The tool reads your task wording and
    the repository's files and recommends a panel, with a reason for each:
 
@@ -136,7 +143,8 @@ You will be asked five things:
      adversarial-qa       <- always recommended
      security             <- task mentions login, oauth, sso
    ```
-3. **Model and effort per reviewer** — each one independently. The same persona
+3. **Model and effort per reviewer** — each one independently. Non-Claude hosts
+   default reviewers to GPT-5.6 Luna at xhigh when available. The same persona
    may appear twice on different models; each slot keeps its own identity and
    they can corroborate each other.
 4. **Mixing** — whether reviewers may use a different CLI to the one you invoked
@@ -153,7 +161,7 @@ Then it runs detached and reports progress:
 ● Review round 1
   ├─ Principal Engineer — Opus @ max
   │  1 high, 2 medium
-  └─ Adversarial QA — GPT-5.6-Luna @ max
+  └─ Adversarial QA — GPT-5.6-Luna @ xhigh
      1 blocker, 1 medium
 
 ● Sending 5 findings to implementer
@@ -334,8 +342,8 @@ wizard every time:
 
 ```json
 {
-  "global_default": { "cli": "codex", "model": "gpt-5.6-luna", "effort": "max" },
-  "implementer": { "cli": "claude", "model": "opus", "effort": "high" },
+  "global_default": { "cli": "codex", "model": "gpt-5.6-luna", "effort": "xhigh" },
+  "implementer": { "cli": "codex", "model": "gpt-5.6-sol", "effort": "medium" },
   "reviewers": ["principal-engineer", "adversarial-qa"],
   "max_iterations": 5,
   "blocking_severities": ["blocker", "high", "medium"]

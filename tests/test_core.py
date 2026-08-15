@@ -36,7 +36,7 @@ from review_loop import (  # noqa: E402
     collect_diff, base_commit, diff_note, preflight_repo, run_validation,
     _claude_argv, _codex_argv, _copilot_argv, _new_run_dir, _porcelain_entries,
     _extract_final_text, canonical_worktree_root, cmd_run, cmd_start, cmd_stop,
-    cmd_suggest, exit_code,
+    cmd_detect, cmd_suggest, exit_code, _role_defaults,
     handoff_lock,
     resolve_config_repo, state_for_repo, worktree_fingerprint,
     _ensure_state_ignored,
@@ -1039,6 +1039,45 @@ class ReadOnlyEnforcement(unittest.TestCase):
                                   "bypassPermissions", Path("/tmp/o"))
                 self.assertIn(required, list(zip(argv, argv[1:])))
                 self.assertNotIn(forbidden, argv)
+
+
+class RoleSpecificDefaults(unittest.TestCase):
+    def test_codex_uses_sol_medium_for_builder_and_luna_xhigh_for_review(self):
+        models = ["gpt-5.6-sol", "gpt-5.6-luna"]
+        with patch("review_loop._codex_models", return_value=models):
+            self.assertEqual(_role_defaults("codex", False),
+                             ("gpt-5.6-sol", "medium"))
+            self.assertEqual(_role_defaults("codex", True),
+                             ("gpt-5.6-luna", "xhigh"))
+
+    def test_copilot_uses_role_models_when_the_harness_reports_them(self):
+        models = ["auto", "gpt-5.6-sol", "gpt-5.6-luna"]
+        with patch("review_loop._copilot_models", return_value=models):
+            self.assertEqual(_role_defaults("copilot", False),
+                             ("gpt-5.6-sol", "medium"))
+            self.assertEqual(_role_defaults("copilot", True),
+                             ("gpt-5.6-luna", "xhigh"))
+
+    def test_copilot_falls_back_to_auto_when_role_models_are_unavailable(self):
+        with patch("review_loop._copilot_models", return_value=["auto"]):
+            self.assertEqual(_role_defaults("copilot", False), ("auto", "medium"))
+            self.assertEqual(_role_defaults("copilot", True), ("auto", "xhigh"))
+
+    def test_detect_exposes_separate_implementer_and_reviewer_defaults(self):
+        output = io.StringIO()
+        models = ["gpt-5.6-sol", "gpt-5.6-luna"]
+        with patch("review_loop.shutil.which", return_value="/usr/bin/agent"), \
+             patch("review_loop._codex_models", return_value=models), \
+             patch("review_loop._copilot_models", return_value=["auto"]), \
+             redirect_stdout(output):
+            self.assertEqual(cmd_detect(types.SimpleNamespace()), 0)
+        codex = json.loads(output.getvalue())["agents"]["codex"]
+        self.assertEqual(codex["implementer_default"],
+                         {"model": "gpt-5.6-sol", "effort": "medium"})
+        self.assertEqual(codex["reviewer_default"],
+                         {"model": "gpt-5.6-luna", "effort": "xhigh"})
+        self.assertEqual(codex["default_model"], "gpt-5.6-sol")
+        self.assertEqual(codex["default_effort"], "medium")
 
 
 class RepoSafety(unittest.TestCase):

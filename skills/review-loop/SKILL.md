@@ -70,7 +70,7 @@ Ask these questions using your host's interactive question mechanism. In Claude 
 
 Load `~/.review-loop/defaults.json` if it exists and use it to pre-fill every answer. Offer to save the answers back there at the end of a successful configuration.
 
-**Question 1 — Build agent.** Which model and effort implements the task. Default to the strongest model the invoking CLI offers, at `high`.
+**Question 1 — Build agent.** Which model and effort implements the task. In Claude Code, default to the strongest model the invoking CLI offers at `high`. In non-Claude hosts (Codex, Cursor, VS Code/Copilot, and similar), default to GPT-5.6 Sol at `medium` when `detect` reports it; otherwise use the detected harness fallback. This role-specific default keeps the strongest model in the coordinating, iterative builder role without overspending on each pass.
 
 **Question 2 — Reviewers.** Do not make the user choose blind. Run:
 
@@ -84,7 +84,7 @@ Two or three reviewers is the useful range. More than four mostly produces dupli
 
 The same persona may appear twice on different models — that is a legitimate way to get two independent opinions from one lens, and the orchestrator gives each slot its own identity so they can corroborate each other.
 
-**Question 3 — Model and effort per reviewer.** Default every reviewer to the global default. Let the user override each one individually. Reviewers benefit from more effort than the implementer: they get one pass and no feedback.
+**Question 3 — Model and effort per reviewer.** Let the user override each reviewer individually. In non-Claude hosts, default every reviewer to GPT-5.6 Luna at `xhigh` when `detect` reports it; otherwise use that harness's detected reviewer fallback. In Claude Code, retain the detected Claude default. Reviewers benefit from more effort than the implementer: they get one pass and no feedback.
 
 **Question 4 — Mixing (only if `detect` found more than one CLI).** Default is no. If the user opts in, re-ask question 3 with models from every detected CLI, labelled by which one they come from. Cross-family reviewers disagree more usefully than same-family ones, which is the main reason to bother.
 
@@ -122,7 +122,7 @@ Config shape:
     { "persona": "principal-engineer", "label": "Principal Engineer",
       "cli": "claude", "model": "opus", "effort": "max" },
     { "persona": "adversarial-qa", "label": "Adversarial QA",
-      "cli": "codex", "model": "gpt-5.6-luna", "effort": "max" }
+      "cli": "codex", "model": "gpt-5.6-luna", "effort": "xhigh" }
   ]
 }
 ```
