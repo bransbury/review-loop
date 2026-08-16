@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-16
+
 ### Changed
 
 - Default non-Claude builders to GPT-5.6 Sol at medium effort and reviewers to
@@ -15,6 +17,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   retaining Opus at high effort for the builder.
 - Document how to update installer, clone, copy, and plugin-based skill
   installations and reload each host afterward.
+- Add a one-command release preparation workflow that updates manifests and
+  changelog metadata, then runs every required local release check.
 
 ## [0.3.0] - 2026-08-12
 
@@ -102,7 +106,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   iterative implementer handoffs.
 - Universal symlink-or-copy installer.
 
-[Unreleased]: https://github.com/bransbury/review-loop/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bransbury/review-loop/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bransbury/review-loop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bransbury/review-loop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bransbury/review-loop/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bransbury/review-loop/commit/1f6fceb

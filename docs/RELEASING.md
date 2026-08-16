@@ -8,25 +8,20 @@ backward-compatible fixes.
 
 1. Start from a clean branch based on the latest `main` and confirm CI is
    green.
-2. Choose the version and run:
+2. Choose the version and run the release preparation command from the
+   repository root:
 
    ```bash
-   python3 scripts/release.py bump X.Y.Z
+   ./create-release vX.Y.Z
    ```
 
-3. Move the relevant entries from `Unreleased` into a dated
-   `## [X.Y.Z] - YYYY-MM-DD` section in `CHANGELOG.md`. Update the comparison
-   links at the bottom of the file.
-4. Validate locally:
+   The command updates both manifests, moves the `Unreleased` notes into a
+   dated release section, updates the comparison links, and runs the complete
+   local release validation suite. It is safe to rerun if release preparation
+   was interrupted.
 
-   ```bash
-   python3 -m unittest discover -s tests -v
-   python3 scripts/release.py check
-   python3 -m compileall -q skills scripts tests
-   bash -n install.sh
-   ```
-
-5. Open and merge a release pull request titled `chore(release): vX.Y.Z`.
+3. Review the generated changes, then open and merge a release pull request
+   titled `chore(release): vX.Y.Z`.
 
 ## Publish the release
 

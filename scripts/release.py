@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -25,6 +26,7 @@ SKILL_VERSION = re.compile(r"(?m)^version:\s*([^\s]+)\s*$")
 CHANGELOG_HEADING = re.compile(
     r"(?m)^## \[(?P<version>[^]]+)](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*$"
 )
+CHANGELOG_LINK = re.compile(r"(?m)^\[(?P<version>[^]]+)]:\s+(?P<url>\S+)\s*$")
 
 
 class ReleaseError(ValueError):
@@ -177,6 +179,143 @@ def bump_version(version: str, root: Path = ROOT) -> None:
     skill_path.write_text(new_frontmatter + remainder)
 
 
+def roll_changelog(
+    version: str, root: Path = ROOT, release_date: Optional[str] = None
+) -> None:
+    """Move Unreleased notes into a dated release and update compare links."""
+    version = parse_version(version)
+    if release_date is None:
+        release_date = date.today().isoformat()
+    else:
+        try:
+            release_date = date.fromisoformat(release_date).isoformat()
+        except ValueError as exc:
+            raise ReleaseError(f"invalid release date: {release_date!r}") from exc
+
+    changelog_path = root / CHANGELOG
+    text = changelog_path.read_text()
+    headings = list(CHANGELOG_HEADING.finditer(text))
+    target = next(
+        (heading for heading in headings if heading.group("version") == version),
+        None,
+    )
+
+    if target is None:
+        unreleased = next(
+            (
+                heading
+                for heading in headings
+                if heading.group("version") == "Unreleased"
+            ),
+            None,
+        )
+        if unreleased is None:
+            raise ReleaseError("CHANGELOG.md has no [Unreleased] section")
+        next_heading = next(
+            (heading for heading in headings if heading.start() > unreleased.start()),
+            None,
+        )
+        if next_heading is None:
+            raise ReleaseError("CHANGELOG.md has no previous release entry")
+        notes = text[unreleased.end() : next_heading.start()].strip()
+        if not notes:
+            raise ReleaseError("CHANGELOG.md [Unreleased] section has no release notes")
+        previous_version = parse_version(next_heading.group("version"))
+        replacement = f"## [Unreleased]\n\n## [{version}] - {release_date}"
+        text = text[: unreleased.start()] + replacement + text[unreleased.end() :]
+    else:
+        if not target.group("date"):
+            raise ReleaseError(f"changelog entry {version} has no release date")
+        following_release = next(
+            (
+                heading
+                for heading in headings
+                if heading.start() > target.start()
+                and heading.group("version") != "Unreleased"
+            ),
+            None,
+        )
+        if following_release is None:
+            raise ReleaseError(f"changelog entry {version} has no previous release")
+        previous_version = parse_version(following_release.group("version"))
+        if not any(heading.group("version") == "Unreleased" for heading in headings):
+            text = text[: target.start()] + "## [Unreleased]\n\n" + text[target.start() :]
+
+    unreleased_link = next(
+        (
+            link
+            for link in CHANGELOG_LINK.finditer(text)
+            if link.group("version") == "Unreleased"
+        ),
+        None,
+    )
+    if unreleased_link is None:
+        raise ReleaseError("CHANGELOG.md has no [Unreleased] comparison link")
+    compare_suffix = re.search(r"/compare/v[^\s]+\.\.\.HEAD$", unreleased_link.group("url"))
+    if compare_suffix is None:
+        raise ReleaseError("CHANGELOG.md [Unreleased] link is not a compare URL")
+    compare_base = unreleased_link.group("url")[: compare_suffix.start()] + "/compare/"
+    new_unreleased_link = f"[Unreleased]: {compare_base}v{version}...HEAD"
+    text = (
+        text[: unreleased_link.start()]
+        + new_unreleased_link
+        + text[unreleased_link.end() :]
+    )
+
+    target_link_text = (
+        f"[{version}]: {compare_base}v{previous_version}...v{version}"
+    )
+    target_link = next(
+        (
+            link
+            for link in CHANGELOG_LINK.finditer(text)
+            if link.group("version") == version
+        ),
+        None,
+    )
+    if target_link is None:
+        new_unreleased_link_end = text.find("\n", text.find(new_unreleased_link))
+        if new_unreleased_link_end == -1:
+            text += "\n" + target_link_text + "\n"
+        else:
+            text = (
+                text[: new_unreleased_link_end + 1]
+                + target_link_text
+                + "\n"
+                + text[new_unreleased_link_end + 1 :]
+            )
+    else:
+        text = text[: target_link.start()] + target_link_text + text[target_link.end() :]
+
+    changelog_path.write_text(text)
+
+
+def prepare_release(
+    version: str, root: Path = ROOT, release_date: Optional[str] = None
+) -> str:
+    """Prepare all versioned release metadata and validate the result."""
+    version = parse_version(version)
+    bump_version(version, root)
+    roll_changelog(version, root, release_date)
+    return validate_release(root, f"v{version}")
+
+
+def run_release_checks(root: Path = ROOT) -> None:
+    checks = (
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        [sys.executable, "scripts/release.py", "check"],
+        [sys.executable, "-m", "compileall", "-q", "skills", "scripts", "tests"],
+        ["bash", "-n", "install.sh", "create-release"],
+    )
+    for command in checks:
+        print(f"+ {' '.join(command)}", flush=True)
+        result = subprocess.run(command, cwd=root, check=False)
+        if result.returncode != 0:
+            raise ReleaseError(
+                f"release check failed ({result.returncode}): {' '.join(command)}"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -190,6 +329,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     bump = subparsers.add_parser("bump", help="set both manifest versions")
     bump.add_argument("version", help="semantic version, with or without v prefix")
+
+    create = subparsers.add_parser(
+        "create", help="prepare release metadata and run all release checks"
+    )
+    create.add_argument("version", help="semantic version, with or without v prefix")
+    create.add_argument(
+        "--date", dest="release_date", help="release date (defaults to today)"
+    )
 
     notes = subparsers.add_parser("notes", help="print one changelog section")
     notes.add_argument("version", help="semantic version, with or without v prefix")
@@ -209,6 +356,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bump_version(version)
             print(f"updated manifests to v{version}")
             print("next: add the dated release section to CHANGELOG.md")
+        elif args.command == "create":
+            version = prepare_release(args.version, release_date=args.release_date)
+            print(f"prepared release metadata for v{version}")
+            run_release_checks()
+            print(f"release v{version} is ready for review and commit")
         elif args.command == "notes":
             sys.stdout.write(changelog_notes(args.version))
     except (OSError, json.JSONDecodeError, ReleaseError) as exc:

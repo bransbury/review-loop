@@ -27,6 +27,7 @@ class ReleaseFixture(unittest.TestCase):
             "## [0.2.0] - 2026-08-09\n\n"
             "### Added\n\n- Safer releases.\n\n"
             "## [0.1.0] - 2026-08-08\n\n- Initial release.\n\n"
+            "[Unreleased]: https://example.test/compare/v0.2.0...HEAD\n"
             "[0.2.0]: https://example.test/v0.2.0\n"
         )
 
@@ -44,7 +45,12 @@ class ReleaseFixture(unittest.TestCase):
 
 class ReleaseValidation(ReleaseFixture):
     def test_current_repository_metadata_is_consistent(self):
-        self.assertEqual("0.3.0", release.validate_release(REPO, "v0.3.0"))
+        plugin_version, skill_version = release.read_versions(REPO)
+        self.assertEqual(plugin_version, skill_version)
+        self.assertEqual(
+            plugin_version,
+            release.validate_release(REPO, f"v{plugin_version}"),
+        )
 
     def test_matching_metadata_and_tag_pass(self):
         self.assertEqual("0.2.0", release.validate_release(self.root, "v0.2.0"))
@@ -78,7 +84,8 @@ class ReleaseValidation(ReleaseFixture):
             capture_output=True,
             check=True,
         )
-        self.assertEqual("review_loop 0.3.0", result.stdout.strip())
+        plugin_version, _ = release.read_versions(REPO)
+        self.assertEqual(f"review_loop {plugin_version}", result.stdout.strip())
 
 
 class ReleaseChanges(ReleaseFixture):
@@ -91,6 +98,51 @@ class ReleaseChanges(ReleaseFixture):
         self.assertIn("Safer releases", notes)
         self.assertNotIn("Initial release", notes)
         self.assertNotIn("https://example.test", notes)
+
+    def test_prepare_release_updates_metadata_changelog_and_links(self):
+        changelog = self.root / "CHANGELOG.md"
+        text = changelog.read_text().replace(
+            "## [Unreleased]\n\n",
+            "## [Unreleased]\n\n### Changed\n\n- Automate releases.\n\n",
+        )
+        changelog.write_text(text)
+
+        self.assertEqual(
+            "0.3.0",
+            release.prepare_release("v0.3.0", self.root, "2026-08-16"),
+        )
+
+        self.assertEqual(("0.3.0", "0.3.0"), release.read_versions(self.root))
+        text = changelog.read_text()
+        self.assertIn("## [Unreleased]\n\n## [0.3.0] - 2026-08-16", text)
+        self.assertIn("- Automate releases.", text)
+        self.assertIn(
+            "[Unreleased]: https://example.test/compare/v0.3.0...HEAD", text
+        )
+        self.assertIn(
+            "[0.3.0]: https://example.test/compare/v0.2.0...v0.3.0", text
+        )
+
+    def test_prepare_release_finishes_partially_completed_release(self):
+        changelog = self.root / "CHANGELOG.md"
+        text = changelog.read_text().replace(
+            "## [Unreleased]\n\n",
+            "## [0.3.0] - 2026-08-16\n\n### Changed\n\n- Automate releases.\n\n",
+        )
+        changelog.write_text(text)
+        self.write_version("0.3.0", "0.3.0")
+
+        release.prepare_release("v0.3.0", self.root, "2026-08-16")
+        release.prepare_release("v0.3.0", self.root, "2026-08-16")
+
+        text = changelog.read_text()
+        self.assertEqual(1, text.count("## [Unreleased]"))
+        self.assertEqual(1, text.count("## [0.3.0] - 2026-08-16"))
+        self.assertEqual(1, text.count("[0.3.0]:"))
+
+    def test_prepare_release_rejects_empty_unreleased_section(self):
+        with self.assertRaisesRegex(release.ReleaseError, "has no release notes"):
+            release.prepare_release("v0.3.0", self.root, "2026-08-16")
 
 
 class ReleaseBranchValidation(unittest.TestCase):
