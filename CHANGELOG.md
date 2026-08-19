@@ -7,6 +7,102 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop terminating agents for being verbose. `max_log_chars` was passed to the
+  process runner as a leash: crossing it sent SIGTERM/SIGKILL mid-run and the
+  dead agent was reported as a failure. It now governs only how much of a
+  transcript is retained, which is what its name always implied. Long reviews
+  and large implementations were being destroyed at the exact point they were
+  doing the most work, and every token they had spent was discarded.
+- Stop rejecting an agent's result because its transcript was long. The result
+  file was checked against the log-retention budget; it now has its own
+  ceiling, since how much an agent explored says nothing about whether its
+  verdict is valid.
+- Keep the tail when truncating error text. Errors were cut with `[:600]`,
+  which preserved the CLI's startup banner and discarded the actual reason
+  appended at the end — leaving runs undiagnosable. All error emissions now
+  keep both ends.
+- A validation command that passes while printing a lot is no longer reported
+  as a failing gate.
+- An empty diff can no longer be approved. Reviewers handed nothing approve in
+  seconds, and the run reported that as `approved` — a clean verdict over a
+  change nobody made. The run now ends as the new `empty_diff` outcome without
+  spending a panel.
+- `render` no longer head-slices agent errors, which had been re-hiding the
+  cause that the event stream now preserves.
+
+### Added
+
+- `base_ref`: the commit to diff from, so a finished branch can be reviewed
+  against the commit its work started from. Previously the base was always
+  HEAD, so already-committed work diffed against itself and the panel was
+  handed nothing. Must resolve to a commit and be an ancestor of HEAD.
+- `review_only`: skip the initial implementation pass and go straight to
+  review. Pointing a build agent at a finished branch invites it to
+  re-implement what is already there. The implementer still runs for fix
+  rounds. Requires `base_ref` or `allow_dirty`.
+- `min_iterations`: review rounds to run even when a round comes back clean.
+  `max_iterations` is a cap, not a target, so a clean first round used to end a
+  run where two independent panels had been asked for.
+- Codex token usage is now recorded and included in the `spend:` line. Only
+  Claude reported usage before, so Codex runs showed no spend at all. Copilot
+  still reports nothing: the adapter passes `--silent`, which suppresses its
+  stats. That is now documented at the parser rather than left looking like an
+  oversight.
+- Codex's startup banner and internal tracing are stripped from error summaries,
+  so a failure leads with its actual reason instead of a models-cache warning.
+  The full transcript is still written to `logs/`, and a failure whose only
+  output was the banner still reports the banner rather than nothing.
+- Provider rate limits are detected and reported as the new `rate_limited`
+  outcome, separately from agent failure. Hitting a usage or session limit
+  previously surfaced as an agent with an empty error message, which the loop
+  treated as "this reviewer contributed nothing" — so it carried on, shrank the
+  panel without saying so, and retried the build agent twice more against the
+  same wall in under four seconds. Detection is structural where the CLI allows
+  it (Claude's `api_error_status`), and phrase-based otherwise; the bare number
+  429 is never treated as a signal. The reset time is parsed out of the
+  message when present.
+- `rate_limit_wait_seconds` (default 0): let a detached run sleep until the
+  quota resets and retry the cut-off agent once, instead of ending. Off by
+  default — a run should not silently sleep for hours nobody asked for.
+
+- `stop --kill` no longer leaves a run with no terminal report. It SIGTERMs the
+  orchestrator deliberately, but nothing handled the signal, so the process
+  died mid-round: no `run_complete`, no `final.md`, and a caller polling the
+  event stream waited forever for an event that was never coming. SIGTERM now
+  unwinds through the normal terminal path and reports `stopped_by_user`.
+- An agent killed while a stop is pending is reported as `stopped_by_user`
+  rather than `implementer_failed`.
+- `final.md` no longer claims "Validation: NOT CONFIGURED — nothing was
+  independently verified" when the build agent failed after the baseline gates
+  had passed. It now reports the baseline result that actually ran.
+
+### Changed
+
+- Reviewer concurrency now defaults to 2 (`max_parallel_reviewers`), down from
+  an effective 4. Reviewers bill one account unless spread across `config_dir`s
+  and they all start together, immediately after the build agent's longest
+  session — the worst moment to burst. Serialising costs wall-clock, which a
+  detached run has to spare.
+- The reviewer prompt now bounds repository exploration, with the budget
+  configurable via `reviewer_read_budget` (default 25 files). Reviewers were
+  reading many times the diff's worth of surrounding code, repeated by every
+  reviewer on every round.
+- A large diff is reported once, with the panel multiplication done, as a
+  `large_diff` event — the only warning about task size that can be made from
+  inside the loop.
+- The default Claude build agent is now Sonnet at high effort; reviewers stay
+  on Opus. The builder runs the longest agentic session and repeats it every
+  fix round: measured runs put it at 49–93% of total spend, against a panel
+  costing a fraction of that. The strong model now goes where the value is,
+  matching what the Codex adapter already did (Sol builds, Luna reviews). The
+  wizard still offers a stronger builder for tasks that warrant one.
+
+Repository reads (`_git_capture`) deliberately keep the strict behaviour via a
+new explicit `fail_on_overflow`: truncated repository state is not a smaller
+truth.
+
 ## [0.4.0] - 2026-08-16
 
 ### Changed

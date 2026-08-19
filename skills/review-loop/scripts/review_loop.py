@@ -36,10 +36,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PERSONA_DIR = SKILL_DIR / "personas"
@@ -51,11 +52,21 @@ PERMISSION_MODES = ["acceptEdits", "bypassPermissions"]
 MAX_REVIEWERS = 8
 MAX_VALIDATION_COMMANDS = 32
 MAX_AGENT_WORKERS = 4
+# Reviewers all bill the same account unless the user has spread them across
+# `config_dir`s, and they start together, immediately after the build agent's
+# longest session — the worst possible moment to burst. Two at a time halves
+# the peak for a panel of three or four while costing only wall-clock, which a
+# detached run has to spare.
+DEFAULT_PARALLEL_REVIEWERS = 2
 MAX_TASK_CHARS = 100_000
 MAX_COMMAND_CHARS = 16_384
 MAX_GIT_CAPTURE_BYTES = 16 * 1024 * 1024
 MAX_FINGERPRINT_FILES = 100_000
 MAX_FINGERPRINT_FILE_BYTES = 512 * 1024 * 1024
+# The result file holds an agent's final message, not its transcript, so it is
+# bounded by the answer rather than by how much the agent explored. Kept well
+# clear of any real verdict so that a thorough review is never discarded.
+MAX_RESULT_BYTES = 8 * 1024 * 1024
 STATE_OWNER = "review-loop managed state v1"
 
 
@@ -204,8 +215,15 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "bin": "claude",
         "argv": _claude_argv,
         "efforts": CLAUDE_EFFORTS,
+        # The builder is the most expensive role by a wide margin — it runs the
+        # longest agentic session and repeats it every fix round — while the
+        # panel is what makes the loop worth running. So the strong model goes
+        # to the reviewers and the builder gets a capable, cheaper one. This
+        # matches what the non-Claude adapters already do (Sol builds, Luna
+        # reviews) and is a default, not a ceiling: the wizard offers Opus for
+        # the builder on tasks that need it.
         "default_effort": "high",
-        "default_model": "opus",
+        "default_model": "sonnet",
         "reviewer_default_effort": "low",
         "reviewer_default_model": "opus",
         "reads_out_file": False,
@@ -464,6 +482,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     numeric_fields = {
         "max_iterations": (1, 20, 5),
+        "min_iterations": (1, 20, 1),
+        "rate_limit_wait_seconds": (0, 86_400, 0),
+        "max_parallel_reviewers": (1, MAX_AGENT_WORKERS, DEFAULT_PARALLEL_REVIEWERS),
+        "reviewer_read_budget": (1, 500, 25),
+        "large_diff_warning_tokens": (1, 2_000_000, 25_000),
         "agent_timeout_seconds": (1, 86_400, 3600),
         "validation_timeout_seconds": (1, 86_400, 1800),
         "max_log_chars": (4, 2_000_000, 100_000),
@@ -480,8 +503,30 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         elif value > maximum:
             errors.append(f"`{field}` must be at most {maximum}.")
 
+    min_iter = config.get("min_iterations", 1)
+    max_iter = config.get("max_iterations", 5)
+    if (isinstance(min_iter, int) and not isinstance(min_iter, bool)
+            and isinstance(max_iter, int) and not isinstance(max_iter, bool)
+            and min_iter > max_iter):
+        errors.append(f"`min_iterations` ({min_iter}) cannot exceed "
+                      f"`max_iterations` ({max_iter}).")
+
+    if config.get("review_only") and not (config.get("base_ref")
+                                          or config.get("allow_dirty")):
+        errors.append("`review_only` needs something to review: set `base_ref` to the "
+                      "commit the work started from, or `allow_dirty` if the work is "
+                      "uncommitted. Without either, the diff is empty.")
+
+    if "base_ref" in config:
+        base_ref = config["base_ref"]
+        if not isinstance(base_ref, str) or not base_ref.strip():
+            errors.append("`base_ref` must be a non-empty git revision string.")
+        elif base_ref.strip().startswith("-"):
+            errors.append("`base_ref` must not start with '-'.")
+
     for field in ("allow_dirty", "allow_non_git", "allow_missing_validation",
-                  "require_clean_baseline", "parallel", "exclude_noise"):
+                  "require_clean_baseline", "parallel", "exclude_noise",
+                  "review_only"):
         if field in config and not isinstance(config[field], bool):
             errors.append(f"`{field}` must be true or false.")
 
@@ -686,6 +731,9 @@ class Run:
         self.config = config
         self.progress = run_dir / "progress.jsonl"
         self.stop_file = run_dir / "STOP"
+        # Set when any agent reports the account is out of quota. The run ends
+        # on it rather than spending the rest of the panel against the wall.
+        self.rate_limited: Optional[str] = None
         self.snapshot: dict[str, Any] = {
             "base_sha": None, "rounds": 0,
             "validation_status": VALIDATION_NOT_CONFIGURED,
@@ -1035,6 +1083,7 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
                       input_text: Optional[str] = None,
                       shell: bool = False,
                       output_limit: int = 100_000,
+                      fail_on_overflow: bool = False,
                       decode_errors: str = "replace") -> tuple[subprocess.CompletedProcess, bool]:
     """Run a command in its own process group and reap the group on timeout.
 
@@ -1042,6 +1091,11 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
     also track descendants that escape the group or sanitize their environment.
     Reader threads retain bounded head/tail output while the process runs and
     keep draining through TERM/KILL cleanup.
+
+    `output_limit` is a retention budget, not a leash: a command that outruns it
+    keeps running and simply has the middle of its transcript elided. Callers
+    that genuinely cannot act on partial output — reading repository state, say —
+    pass `fail_on_overflow` to get the strict behaviour instead.
     """
     marker = secrets.token_hex(16)
     child_env = dict(os.environ if env is None else env)
@@ -1123,9 +1177,6 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
             proc.stdin.close()
         deadline = time.monotonic() + timeout
         while proc.poll() is None:
-            if stdout_buf.exceeded.is_set() or stderr_buf.exceeded.is_set():
-                output_exceeded = True
-                break
             if time.monotonic() >= deadline:
                 timed_out = True
                 break
@@ -1133,9 +1184,15 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
         if proc.poll() is not None:
             for reader in readers:
                 reader.join(timeout=0.5)
-        output_exceeded = (output_exceeded or stdout_buf.exceeded.is_set()
+        # Verbosity is not a failure. `_BoundedBytes` already caps what is held
+        # in memory and written to disk, so a chatty command costs nothing but
+        # the elided middle of its own transcript. Killing it here used to
+        # destroy the most thorough reviews and the longest implementations at
+        # the exact moment they were doing the most work, and reported the
+        # corpse as an agent failure. Wall-clock is bounded by `timeout`.
+        output_exceeded = (stdout_buf.exceeded.is_set()
                            or stderr_buf.exceeded.is_set())
-        if not timed_out and not output_exceeded:
+        if not timed_out and not (fail_on_overflow and output_exceeded):
             # A CLI may exit after launching a detached helper. The command is
             # complete only when its recorded descendants are gone too.
             remaining = ((tracker.live() | _marked_processes(marker)) - {proc.pid})
@@ -1147,7 +1204,7 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
                     time.sleep(0.02)
                 _signal_process_tree(proc.pid, signal.SIGKILL, marker)
                 tracker.signal(signal.SIGKILL)
-        if timed_out or output_exceeded:
+        if timed_out or (fail_on_overflow and output_exceeded):
             _signal_process_tree(proc.pid, signal.SIGTERM, marker)
             tracker.signal(signal.SIGTERM)
             grace = time.monotonic() + 1.0
@@ -1186,8 +1243,14 @@ def _run_process_tree(args: Any, *, cwd: Path, timeout: int,
     stderr = stderr_buf.text(decode_errors)
     rc = proc.returncode
     if output_exceeded:
-        rc = rc if rc not in (None, 0) else 1
-        stderr += f"\noutput exceeded the {output_limit}-byte safety limit"
+        if fail_on_overflow:
+            rc = rc if rc not in (None, 0) else 1
+            stderr += f"\noutput exceeded the {output_limit}-byte safety limit"
+        else:
+            # Informational only: the command's own exit status still decides
+            # whether it succeeded.
+            stderr += (f"\n[retained output capped at {output_limit} bytes; the "
+                       f"middle was elided. The command ran to completion.]")
     completed = subprocess.CompletedProcess(args, rc, stdout, stderr)
     return completed, timed_out
 
@@ -1195,18 +1258,61 @@ def invoke_agent(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
                  label: str, log_name: str, attempts: int = 1) -> tuple[bool, str]:
     """Run one agent to completion. Retries only on transient process failure."""
     last = "no attempt made"
-    for attempt in range(1, max(1, attempts) + 1):
-        suffix = "" if attempt == 1 else f"-retry{attempt - 1}"
+    invocations = 0
+    failures = 0
+    waited = False
+    while True:
+        invocations += 1
+        # Every invocation gets its own log name, including one that follows a
+        # rate-limit wait — otherwise the retry overwrites the record of what
+        # it was retrying.
+        suffix = "" if invocations == 1 else f"-retry{invocations - 1}"
         ok, text = _invoke_once(run, slot, prompt, readonly,
-                                label if attempt == 1 else f"{label} (retry {attempt - 1})",
+                                label if invocations == 1
+                                else f"{label} (retry {invocations - 1})",
                                 log_name + suffix)
         if ok:
             return True, text
         last = text
-        if attempt < attempts:
-            run.emit("agent_retry", label=label, attempt=attempt, error=text[:300])
-            time.sleep(5)
-    return False, last
+        if run.rate_limited:
+            # Retrying now would fail in under two seconds and burn the attempt
+            # that a real error deserves, so a quota wall never counts as one.
+            # Wait for the reset if the user asked for that, otherwise stop and
+            # let the run end cleanly.
+            if waited or not _wait_for_rate_limit(run, label):
+                return False, last
+            waited = True
+            run.rate_limited = None
+            continue
+        failures += 1
+        if failures >= max(1, attempts):
+            return False, last
+        run.emit("agent_retry", label=label, attempt=failures,
+                 error=_head_tail(text, 300))
+        time.sleep(5)
+
+
+def _wait_for_rate_limit(run: Run, label: str) -> bool:
+    """Sleep until the quota resets, if the run was configured to wait."""
+    budget = int(run.config.get("rate_limit_wait_seconds", 0))
+    if budget <= 0:
+        return False
+    message = run.rate_limited or ""
+    delay = rate_limit_delay(message)
+    if delay is None:
+        delay = min(budget, 300)
+    if delay > budget:
+        run.emit("warning", message=f"{label} is rate limited for about "
+                 f"{delay // 60} minutes, which exceeds `rate_limit_wait_seconds` "
+                 f"({budget}s). Stopping instead of waiting.")
+        return False
+    run.emit("rate_limit_wait", label=label, seconds=delay, detail=message)
+    deadline = time.monotonic() + delay + 5
+    while time.monotonic() < deadline:
+        if run.should_stop():
+            return False
+        time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+    return True
 
 
 def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
@@ -1275,10 +1381,13 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
         return False, f"{label} timed out after {timeout}s"
 
     if ad["reads_out_file"] and out_file.exists():
-        if out_file.lstat().st_size > log_cap:
+        # Guard only against a pathological file. This deliberately does not
+        # use the log-retention budget: how much an agent explored says nothing
+        # about whether its verdict is valid.
+        if out_file.lstat().st_size > MAX_RESULT_BYTES:
             run.emit("agent_error", label=label,
-                     error=f"agent output file exceeded {log_cap} bytes")
-            return False, f"{label} output exceeded the configured safety limit"
+                     error=f"agent result file exceeded {MAX_RESULT_BYTES} bytes")
+            return False, f"{label} result file exceeded {MAX_RESULT_BYTES} bytes"
         text = out_file.read_text(errors="replace")
     else:
         text = _extract_final_text(cli, proc.stdout)
@@ -1294,11 +1403,22 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
                           "(ideally inside a git worktree) so the build agent can run tests.")
 
     elapsed = round(time.time() - started, 1)
+    limit_message = rate_limit_message(cli, proc.stdout, proc.stderr)
+    if limit_message:
+        # Not "the agent failed": the account is out of quota. The distinction
+        # decides whether it is worth spending anything else this run.
+        run.rate_limited = limit_message
+        reset_in = rate_limit_delay(limit_message)
+        run.emit("rate_limited", label=label, detail=limit_message,
+                 resets_in_seconds=reset_in, seconds=elapsed,
+                 **_usage(cli, proc.stdout))
+        return False, f"{label} hit a provider limit: {limit_message}"
     if proc.returncode != 0:
+        stderr_text = _clean_stderr(cli, (proc.stderr or "").strip())
         run.emit("agent_error", label=label, rc=proc.returncode,
-                 error=(proc.stderr or "").strip()[:600], seconds=elapsed)
-        detail = (proc.stderr or text or f"exit {proc.returncode}").strip()
-        return False, detail[:600]
+                 error=_head_tail(stderr_text, 600), seconds=elapsed)
+        detail = (stderr_text or text or f"exit {proc.returncode}").strip()
+        return False, _head_tail(detail, 600)
     if not text.strip():
         run.emit("agent_error", label=label, rc=proc.returncode,
                  error="agent produced no output", seconds=elapsed)
@@ -1309,12 +1429,33 @@ def _invoke_once(run: Run, slot: dict[str, Any], prompt: str, readonly: bool,
     return True, text
 
 
+_CODEX_TOKENS = re.compile(r"tokens used\s*\n\s*([\d,]+)", re.I)
+
+
 def _usage(cli: str, stdout: str) -> dict[str, Any]:
     """Pull real token and cost figures out of the CLI's response envelope.
 
-    Only Claude reports these today. Where a CLI does not, spend stays
-    unreported rather than being guessed at from character counts.
+    Claude reports a full breakdown; Codex reports a single total on its last
+    line. Where a CLI reports nothing, spend stays unreported rather than being
+    guessed at from character counts — an unmeasured run should look unmeasured.
+
+    Copilot reports nothing here by construction, not by omission: the adapter
+    passes `--silent`, which its own help defines as "output only the agent
+    response (no stats)". Recovering usage would mean invoking it differently —
+    `--output-format json` emits JSONL shaped `{"type", "data", "id",
+    "timestamp", "parentId"}`, which is not the `text`/`content` shape
+    `_extract_final_text` expects for Copilot today. Both halves of that change
+    need verifying against a Copilot account that can actually complete a
+    request before either is worth making.
     """
+    if cli == "codex":
+        matches = _CODEX_TOKENS.findall(stdout or "")
+        if not matches:
+            return {}
+        try:
+            return {"tok_total": int(matches[-1].replace(",", ""))}
+        except ValueError:
+            return {}
     if cli != "claude":
         return {}
     try:
@@ -1331,6 +1472,29 @@ def _usage(cli: str, stdout: str) -> dict[str, Any]:
         return out
     except Exception:
         return {}
+
+
+# Codex writes a startup banner and its internal tracing to stderr on every
+# invocation, so an error summary that leads with them says nothing about why
+# the run stopped. These lines are dropped from the *summary* only; the full
+# transcript is still written to logs/.
+_CODEX_NOISE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex_\w+"
+    r"|OpenAI Codex v[\d.]+"
+    r"|-{4,}"
+    r"|(?:workdir|model|provider|approval|sandbox|reasoning effort|reasoning summaries):\s)",
+    re.I)
+
+
+def _clean_stderr(cli: str, text: str) -> str:
+    """Strip a CLI's boilerplate so the summary leads with the actual reason."""
+    if cli != "codex" or not text:
+        return text or ""
+    kept = [ln for ln in text.splitlines() if not _CODEX_NOISE.match(ln.strip())]
+    cleaned = "\n".join(kept).strip()
+    # Never turn a diagnosable failure into a silent one: if the banner was all
+    # there was, report the banner.
+    return cleaned or text.strip()
 
 
 def _head_tail(text: str, limit: int) -> str:
@@ -1350,6 +1514,83 @@ def _permission_denials(cli: str, stdout: str) -> list[Any]:
         return denials if isinstance(denials, list) else []
     except Exception:
         return []
+
+
+# Phrases every provider uses for "you are out of quota". Deliberately not the
+# bare number 429: it appears in timings, byte counts and SHAs.
+_RATE_LIMIT_PHRASES = re.compile(
+    r"(session limit|usage limit|rate limit(?:ed)?|quota exceeded|out of quota"
+    r"|too many requests|resets? (?:at|in) |retry[- ]after)", re.I)
+_RESET_CLOCK = re.compile(
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*(?:\(([^)]+)\))?", re.I)
+
+
+def rate_limit_message(cli: str, stdout: str, stderr: str = "") -> Optional[str]:
+    """Detect "the account is out of quota", distinct from "the agent failed".
+
+    The difference matters more than it looks. A reviewer that ran out of quota
+    did not review and find nothing — it never reviewed. Treating the two the
+    same is how a run keeps spending after the wall has been hit, and how a
+    quiet panel gets mistaken for a clean one.
+    """
+    if cli == "claude":
+        try:
+            env = json.loads(stdout)
+        except Exception:
+            env = None
+        if isinstance(env, dict):
+            status = env.get("api_error_status")
+            result = str(env.get("result") or "")
+            if status == 429 or (env.get("is_error") and _RATE_LIMIT_PHRASES.search(result)):
+                return result.strip() or "rate limited (HTTP 429)"
+            # A structurally clean envelope is not rate limited, whatever
+            # numbers happen to appear inside its usage figures.
+            return None
+    for blob in (stderr, stdout):
+        if blob and _RATE_LIMIT_PHRASES.search(blob):
+            for line in blob.splitlines():
+                if _RATE_LIMIT_PHRASES.search(line):
+                    return line.strip()[:300]
+    return None
+
+
+def rate_limit_delay(message: str, now: Optional[datetime] = None) -> Optional[int]:
+    """Seconds until the quota resets, when the message says so.
+
+    Returns None when there is no clock to read, so the caller falls back to
+    its own budget rather than inventing a reset time.
+    """
+    match = _RESET_CLOCK.search(message or "")
+    if not match:
+        return None
+    hour_s, minute_s, meridiem, zone = match.groups()
+    try:
+        hour = int(hour_s)
+    except ValueError:
+        return None
+    minute = int(minute_s) if minute_s else 0
+    if not 0 <= minute < 60:
+        return None
+    if meridiem:
+        meridiem = meridiem.replace(".", "").lower()
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif not 0 <= hour < 24:
+        return None
+    tz: Optional[tzinfo] = None
+    if zone:
+        try:
+            tz = ZoneInfo(zone.strip())
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            tz = None
+    reference = now or datetime.now(tz=tz)
+    if reference.tzinfo is None and tz is not None:
+        reference = reference.replace(tzinfo=tz)
+    target = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= reference:
+        target += timedelta(days=1)
+    return max(0, int((target - reference).total_seconds()))
 
 
 def _extract_final_text(cli: str, stdout: str) -> str:
@@ -1821,7 +2062,10 @@ def _git_capture(repo: Path, *args: str, limit: int = MAX_GIT_CAPTURE_BYTES) -> 
     try:
         r, timed_out = _run_process_tree(
             ["git", *args], cwd=repo, timeout=120, output_limit=limit,
-            decode_errors="surrogateescape")
+            # Truncated repository state is not a smaller truth. Everything
+            # downstream — the diff, the untracked listing, the fingerprint —
+            # assumes it saw everything git had to say.
+            fail_on_overflow=True, decode_errors="surrogateescape")
     except OSError as exc:
         raise GitError(f"could not run git {' '.join(args)}: {exc}") from exc
     if timed_out:
@@ -1903,6 +2147,13 @@ def preflight_repo(repo: Path, config: dict[str, Any]) -> list[str]:
         raw = _git_capture(repo, "status", "--porcelain", "-z")
     except (OSError, GitError) as exc:
         return [f"could not verify working-tree cleanliness: {exc}"]
+    base_ref = config.get("base_ref")
+    if isinstance(base_ref, str) and base_ref.strip():
+        try:
+            resolve_base_ref(repo, base_ref)
+        except (OSError, GitError) as exc:
+            problems.append(str(exc))
+
     dirty = [path for _, path in _porcelain_entries(raw)]
     if dirty and not config.get("allow_dirty"):
         names = dirty[:10]
@@ -2141,9 +2392,37 @@ def _pid_is_review_loop(pid: int, run_dir: Path) -> bool:
             and str((run_dir / "config.json").resolve()) in command)
 
 
+def resolve_base_ref(repo: Path, base_ref: str) -> str:
+    """Resolve a caller-supplied review base to a commit SHA.
+
+    Reviewing work that is already committed is a first-class case: the panel
+    is useful long after the build agent has finished. Without this the base is
+    always HEAD, so a completed branch diffs against itself and the reviewers
+    are handed nothing.
+    """
+    ref = base_ref.strip()
+    if not ref or ref.startswith("-"):
+        raise GitError(f"invalid `base_ref`: {base_ref!r}")
+    try:
+        sha = git(repo, "rev-parse", "--verify", "--end-of-options",
+                  f"{ref}^{{commit}}")
+    except GitError as exc:
+        raise GitError(f"`base_ref` {ref!r} does not resolve to a commit: {exc}") from exc
+    # A base that is not behind HEAD produces a diff that mixes "what this work
+    # changed" with "what it never touched", which is not what anyone means by
+    # a review base.
+    try:
+        git(repo, "merge-base", "--is-ancestor", sha, "HEAD")
+    except GitError as exc:
+        raise GitError(f"`base_ref` {ref!r} ({sha[:12]}) is not an ancestor of HEAD; "
+                       f"the diff would not describe this branch's work") from exc
+    return sha
+
+
 def base_commit(repo: Path, allow_non_git: bool = False,
-                git_worktree: Optional[bool] = None) -> Optional[str]:
-    """The SHA the loop started from, or None in a repository with no commits."""
+                git_worktree: Optional[bool] = None,
+                base_ref: Optional[str] = None) -> Optional[str]:
+    """The SHA the loop reviews from, or None in a repository with no commits."""
     if git_worktree is False:
         return None
     if allow_non_git and git_worktree is None:
@@ -2154,6 +2433,8 @@ def base_commit(repo: Path, allow_non_git: bool = False,
             return None
         if probe.returncode != 0 or probe.stdout.strip() != "true":
             return None
+    if base_ref:
+        return resolve_base_ref(repo, base_ref)
     head_error: Optional[GitError] = None
     try:
         return git(repo, "rev-parse", "--verify", "HEAD")
@@ -2519,6 +2800,14 @@ were correct or complete, and look for regressions introduced by recent fixes.
 Inspect the surrounding code in the repository rather than reviewing the diff
 in isolation, but do not re-read files the diff already shows you in full.
 
+Read what you need to judge this diff and stop there. Follow a call into its
+definition, check a helper you suspect already exists, confirm a caller you
+think breaks — that is the job. Auditing the whole repository is not: it costs
+many times the diff itself, it is repeated by every reviewer on the panel every
+round, and past roughly {read_budget} files it stops changing verdicts. If you
+run out of budget before you are certain, say so in the finding rather than
+reading further; an honest "verify X" beats another twenty file reads.
+
 {shape}
 
 <task>
@@ -2595,10 +2884,21 @@ def load_persona(persona_id: str) -> str:
 # The loop
 # ---------------------------------------------------------------------------
 
+class StopRequested(Exception):
+    """SIGTERM reached the orchestrator — `stop --kill`, or an operator.
+
+    Raised out of the signal handler so the run unwinds through the normal
+    terminal-report path. Dying where the signal landed left the caller polling
+    an event stream that had already stopped, which is the one thing the
+    terminal contract exists to prevent.
+    """
+
+
 def _terminal_run_failure(config: dict[str, Any], repo: Path, state: Path,
                           run_dir: Path, detail: str,
                           stage: str = "orchestration",
-                          existing_run: Optional[Run] = None) -> int:
+                          existing_run: Optional[Run] = None,
+                          outcome: str = "run_failed") -> int:
     """Write the terminal contract even when normal orchestration unwinds."""
     run_dir.mkdir(parents=True, exist_ok=True)
     run = existing_run or Run(repo, run_dir, config)
@@ -2607,10 +2907,11 @@ def _terminal_run_failure(config: dict[str, Any], repo: Path, state: Path,
     if not isinstance(ledger, Ledger):
         ledger = Ledger()
     stage = str(snapshot.get("stage") or stage) if existing_run else stage
-    run.emit("run_failed", stage=stage, error=detail[:1000])
+    run.emit("run_failed" if outcome == "run_failed" else "run_stopped",
+             stage=stage, error=_head_tail(detail, 1000))
     try:
         final = _write_final(
-            run, snapshot.get("base_sha"), "run_failed", ledger,
+            run, snapshot.get("base_sha"), outcome, ledger,
             int(snapshot.get("rounds") or 0),
             str(snapshot.get("validation_status") or VALIDATION_NOT_CONFIGURED),
             set(config.get("blocking_severities") or ["blocker", "high", "medium"]),
@@ -2620,7 +2921,7 @@ def _terminal_run_failure(config: dict[str, Any], repo: Path, state: Path,
         )
     except Exception as exc:
         # Reporting must not repeat the exception that brought the loop here.
-        body = ("# Review loop result\n\n**Outcome: run_failed**\n\n"
+        body = (f"# Review loop result\n\n**Outcome: {outcome}**\n\n"
                 f"- Failure stage: {stage}\n"
                 f"- Error: {detail}\n"
                 f"- Report fallback error: {type(exc).__name__}: {exc}\n")
@@ -2631,15 +2932,15 @@ def _terminal_run_failure(config: dict[str, Any], repo: Path, state: Path,
         except OSError:
             pass
     validation_status = str(snapshot.get("validation_status") or VALIDATION_NOT_CONFIGURED)
-    run.emit("run_complete", outcome="run_failed",
+    run.emit("run_complete", outcome=outcome,
              rounds=int(snapshot.get("rounds") or 0), findings=len(ledger.entries),
              resolved=len(ledger.resolved()),
              blocking_open=len(ledger.open_findings()),
              validation_status=validation_status,
              validation_passed=validation_status == VALIDATION_PASSED,
              missing_reviewers=list(snapshot.get("missing_reviewers") or []),
-             final=str(final), error=detail[:400])
-    return exit_code("run_failed")
+             final=str(final), error=_head_tail(detail, 400))
+    return exit_code(outcome)
 
 
 def _terminalize_handed_failure(config: dict[str, Any], state: Path,
@@ -2752,8 +3053,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         # tell our lock from a later run's.
         handoff_lock(state, token, os.getpid(), run_dir)
         run_obj = Run(repo, run_dir, config)
+
+        def _on_sigterm(_signum: int, _frame: Any) -> None:
+            raise StopRequested("SIGTERM")
+
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform without it: the run simply
+            # keeps the default disposition.
+            pass
         try:
             return _run_loop(config, repo, state, run_dir, run_obj)
+        except StopRequested:
+            # `stop --kill` SIGTERMs this process on purpose. Dying here would
+            # leave final.md missing and the event stream ending mid-round.
+            return _terminal_run_failure(
+                config, repo, state, run_dir,
+                "the run was stopped on request", "stopped",
+                existing_run=run_obj, outcome="stopped_by_user")
         except Exception as exc:
             # A detached caller only has the event stream and final report.
             # Never leave it polling forever because an unanticipated error
@@ -2809,9 +3127,11 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
     task = config["task"]
     blocking = set(config.get("blocking_severities") or ["blocker", "high", "medium"])
     max_iter = int(config.get("max_iterations", 5))
+    min_iter = min(int(config.get("min_iterations", 1)), max_iter)
 
     base_sha = base_commit(repo, allow_non_git=bool(config.get("allow_non_git")),
-                           git_worktree=config.get("_git_worktree"))
+                           git_worktree=config.get("_git_worktree"),
+                           base_ref=config.get("base_ref"))
     run.snapshot.update({"base_sha": base_sha, "stage": "baseline"})
     if base_sha is None:
         run.emit("warning", message="Repository has no commits; reviewing the whole working tree.")
@@ -2860,21 +3180,41 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
                       + _validation_note(baseline_status, baseline_results))
 
     run.snapshot["stage"] = "implement"
-    ok, text = invoke_agent(run, config["implementer"],
-                            IMPLEMENTER_PROMPT.format(task=task, validation_note=gate_note),
-                            readonly=False, label="Implementer",
-                            log_name="iter00-implementer", attempts=2)
+    if config.get("review_only"):
+        # Reviewing work that is already written. Sending a build agent at a
+        # finished branch invites it to re-implement what is already there, so
+        # the pass is skipped outright rather than asked nicely to do nothing.
+        # The implementer still runs for fix rounds, once a reviewer has raised
+        # something concrete.
+        run.emit("implementer_skipped", reason="review_only")
+        ok, text = True, "(review-only run: no implementation pass)"
+    else:
+        ok, text = invoke_agent(run, config["implementer"],
+                                IMPLEMENTER_PROMPT.format(task=task, validation_note=gate_note),
+                                readonly=False, label="Implementer",
+                                log_name="iter00-implementer", attempts=2)
     if not ok:
         # Still write the report and emit run_complete: whoever is polling the
         # progress stream must never be left waiting for an event that is not
         # coming.
+        if run.rate_limited:
+            stalled = "rate_limited"
+        elif run.should_stop():
+            # The user pulled the handbrake. Reporting that as a build-agent
+            # failure sends everyone looking for a bug that is not there.
+            stalled = "stopped_by_user"
+        else:
+            stalled = "implementer_failed"
         run.emit("run_failed", stage="implement", error=text)
-        final = _write_final(run, base_sha, "implementer_failed", Ledger(), 0,
-                             VALIDATION_NOT_CONFIGURED, blocking, baseline_status)
-        run.emit("run_complete", outcome="implementer_failed", rounds=0, findings=0,
-                 blocking_open=0, validation_status=VALIDATION_NOT_CONFIGURED,
-                 final=str(final), error=text[:400])
-        return exit_code("implementer_failed")
+        # The baseline gate really did run; saying "NOT CONFIGURED" here told
+        # the reader nothing was verified when four commands had just passed.
+        final = _write_final(run, base_sha, stalled, Ledger(), 0,
+                             baseline_status, blocking, baseline_status)
+        run.emit("run_complete", outcome=stalled, rounds=0, findings=0,
+                 blocking_open=0, validation_status=baseline_status,
+                 validation_passed=baseline_status == VALIDATION_PASSED,
+                 final=str(final), error=_head_tail(text, 400))
+        return exit_code(stalled)
     _safe_write_text(run_dir / "implementer-00.md", text)
 
     outcome = "max_iterations_reached"
@@ -2911,10 +3251,35 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
             )
         run.snapshot["stage"] = "diff_collection"
         diff, manifest = collect_diff(repo, base_sha, config)
-        if not diff.strip():
-            run.emit("warning", message="Diff is empty; implementer may not have changed anything.")
         run.emit("diff_ready", iteration=iteration, **{
             k: v for k, v in manifest.items() if k in ("chars", "approx_tokens", "files")})
+
+        # Nothing to review is not the same fact as nothing wrong. Reviewers
+        # handed an empty diff approve it in seconds, and the run would report
+        # that as `approved` — a clean verdict over a change nobody made. This
+        # is the same rule as "a gate that never ran did not pass".
+        if not diff.strip():
+            run.emit("warning", message="The diff is empty: there is nothing to review. "
+                     "Either the implementer changed nothing, or `base_ref` needs to "
+                     "name the commit the work started from.")
+            outcome = "empty_diff"
+            break
+
+        # The diff is the one cost that is knowable in advance, and it is paid
+        # by every reviewer on every round. Saying so once, with the
+        # multiplication done, is the only warning about task size that can be
+        # made from inside the loop.
+        approx = int(manifest.get("approx_tokens") or 0)
+        if iteration == 1 and approx >= int(config.get("large_diff_warning_tokens", 25_000)):
+            projected = approx * len(config["reviewers"])
+            run.emit("large_diff", iteration=iteration, approx_tokens=approx,
+                     files=manifest.get("files"),
+                     projected_tokens_per_round=projected,
+                     message=f"This diff is ~{approx:,} tokens across "
+                             f"{manifest.get('files')} files, so a single round costs at "
+                             f"least ~{projected:,} tokens of input before any reviewer "
+                             f"reads a file. Large tasks are better split than reviewed "
+                             f"whole: rounds scale with scope.")
 
         # The same payload goes to every reviewer, so its size is multiplied by
         # the size of the panel. Report it once so the cost is visible.
@@ -2925,7 +3290,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
 
         # If a fix round changed nothing, re-reviewing an identical payload
         # would cost a full panel and return the same answer.
-        if iteration > 1 and diff == previous_diff:
+        if iteration > 1 and diff == previous_diff and iteration > min_iter:
             run.emit("warning", message="Fix round produced no change to the diff; "
                                         "stopping rather than re-reviewing identical code.")
             outcome = "no_progress"
@@ -2944,6 +3309,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
                 persona=load_persona(rv["persona"]),
                 task=task, diff=diff, validation_note=validation_note,
                 diff_note=diff_note(manifest, config), shape=OUTPUT_SHAPE,
+                read_budget=int(config.get("reviewer_read_budget", 25)),
             )
             ok_, text_ = invoke_agent(
                 run, rv, prompt, readonly=True,
@@ -2953,8 +3319,12 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
             return rv, ok_, text_
 
         reviewers = config["reviewers"]
-        workers = min(len(reviewers), MAX_AGENT_WORKERS) \
-            if config.get("parallel", True) else 1
+        if config.get("parallel", True):
+            workers = min(len(reviewers), MAX_AGENT_WORKERS,
+                          int(config.get("max_parallel_reviewers",
+                                         DEFAULT_PARALLEL_REVIEWERS)))
+        else:
+            workers = 1
         run.snapshot["stage"] = "review"
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             results = list(pool.map(do_review, reviewers))
@@ -2964,6 +3334,15 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
                 "worktree changed after validation/diff collection while reviewers "
                 "were running; approval is invalid and the run failed closed"
             )
+
+        if run.rate_limited:
+            # The rest of the panel is about to hit the same wall, and so is
+            # the next round. Stop while the report still says something true.
+            run.emit("warning", message="A reviewer was cut off by a provider limit, "
+                     "so this round is incomplete and the run cannot approve. "
+                     f"Detail: {run.rate_limited}")
+            outcome = "rate_limited"
+            break
 
         round_findings: list[dict[str, Any]] = []
         missing_reviewers = []
@@ -3038,6 +3417,14 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
                     outcome = "validation_not_configured"
                 break
             if val_ok:
+                if iteration < min_iter:
+                    # Fresh sessions disagree with each other. When the user
+                    # asked for a floor of panels, one clean round is a data
+                    # point, not the answer.
+                    run.emit("warning", message=f"Round {iteration} is clean, but "
+                             f"`min_iterations` is {min_iter}; running another panel "
+                             "over the same code rather than stopping early.")
+                    continue
                 outcome = "approved"
                 break
             run.emit("warning", message="Reviewers approved but validation is failing; "
@@ -3051,7 +3438,7 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
         # round, the implementer is not converging. Another round costs a full
         # panel plus a fix and will almost certainly return the same answer.
         signature = {f"{f['file']}:{f['severity']}:{f['problem'][:80]}" for f in blockers}
-        if signature and signature == previous_signature:
+        if signature and signature == previous_signature and iteration >= min_iter:
             run.emit("warning", message="The same blocking findings survived a fix round; "
                                         "stopping rather than looping on them.")
             outcome = "no_progress"
@@ -3069,7 +3456,12 @@ def _run_loop(config: dict[str, Any], repo: Path, state: Path, run_dir: Path,
                                 log_name=f"iter{iteration:02d}-fix", attempts=2)
         if not ok:
             run.emit("run_failed", stage="fix", error=text)
-            outcome = "implementer_failed"
+            if run.rate_limited:
+                outcome = "rate_limited"
+            elif run.should_stop():
+                outcome = "stopped_by_user"
+            else:
+                outcome = "implementer_failed"
             break
         _safe_write_text(run_dir / f"implementer-{iteration:02d}.md", text)
 
@@ -3171,6 +3563,15 @@ OUTCOME_NOTE = {
                        "baseline is required by default so the task cannot silently grow. "
                        "Fix the build first, or explicitly set `require_clean_baseline: "
                        "false` for a task whose purpose includes repairing it.",
+    "rate_limited": "The provider cut the run off: the account hit its usage or session "
+                    "limit part-way through. Whatever had already been spent on that "
+                    "round bought nothing, and the reviewers that never answered did not "
+                    "review and approve — they never ran. Wait for the reset and re-run, "
+                    "or set `rate_limit_wait_seconds` so the loop waits by itself.",
+    "empty_diff": "There was no diff to review, so no reviewer saw any code. An empty "
+                  "diff approved by a panel is not a clean review, it is an absent one. "
+                  "Either the build agent changed nothing, or the review base is wrong — "
+                  "set `base_ref` to the commit the work started from.",
     "max_iterations_reached": "The loop hit its iteration cap with blocking findings "
                               "still open. This needs a human — do not simply raise the cap.",
     "stopped_by_user": "Stopped on request. The working tree holds whatever the last "
@@ -3498,17 +3899,22 @@ SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 
 def _spend(events: list[dict[str, Any]]) -> str:
     """Total reported token use and cost across every agent invocation."""
-    cost = sum(e.get("cost_usd", 0) or 0 for e in events if e.get("event") == "agent_done")
-    fresh = sum(e.get("tok_in", 0) or 0 for e in events if e.get("event") == "agent_done")
-    cached = sum(e.get("tok_cache_read", 0) or 0 for e in events if e.get("event") == "agent_done")
-    outp = sum(e.get("tok_out", 0) or 0 for e in events if e.get("event") == "agent_done")
-    if not (cost or fresh or cached or outp):
+    done = [e for e in events if e.get("event") == "agent_done"]
+    cost = sum(e.get("cost_usd", 0) or 0 for e in done)
+    fresh = sum(e.get("tok_in", 0) or 0 for e in done)
+    cached = sum(e.get("tok_cache_read", 0) or 0 for e in done)
+    outp = sum(e.get("tok_out", 0) or 0 for e in done)
+    total = sum(e.get("tok_total", 0) or 0 for e in done)
+    if not (cost or fresh or cached or outp or total):
         return ""
     bits = []
     if fresh or cached:
         bits.append(f"{fresh + cached:,} in ({cached:,} cached)")
     if outp:
         bits.append(f"{outp:,} out")
+    if total:
+        # Codex reports one figure per invocation with no input/output split.
+        bits.append(f"{total:,} total")
     if cost:
         bits.append(f"${cost:.2f}")
     return "spend: " + " · ".join(bits)
@@ -3554,6 +3960,9 @@ def cmd_render(args: argparse.Namespace) -> int:
                        f"· max {plural(e.get('max_iterations'), 'round')}")
             out.append(f"  panel: {revs}")
             out.append("")
+        elif ev == "implementer_skipped":
+            out.append("● Implementer — skipped (review-only run)")
+            out.append("")
         elif ev == "agent_start":
             agents[e["label"]] = e
             if not e.get("readonly"):
@@ -3566,8 +3975,22 @@ def cmd_render(args: argparse.Namespace) -> int:
                 if out and out[-1].strip() == "▸ running…":
                     out.pop()
                 out.append(f"  ✓ complete ({e.get('seconds')}s)")
+        elif ev == "large_diff":
+            out.append(f"  ⚠ large diff: ~{e.get('approx_tokens', 0):,} tokens × "
+                       f"panel = ~{e.get('projected_tokens_per_round', 0):,} per round")
+        elif ev == "rate_limited":
+            resets = e.get("resets_in_seconds")
+            when = f" — resets in ~{resets // 60} min" if isinstance(resets, int) else ""
+            out.append(f"  ⚠ {e['label']} was cut off by a provider limit{when}")
+            out.append(f"    {str(e.get('detail') or '').strip()[:160]}")
+        elif ev == "rate_limit_wait":
+            out.append(f"  ⏸ waiting ~{int(e.get('seconds', 0)) // 60} min for the "
+                       f"{e['label']} quota to reset")
         elif ev == "agent_error":
-            out.append(f"  ✗ {e['label']} failed: {str(e.get('error'))[:120]}")
+            # Head-slicing here would re-hide the cause that the event stream
+            # went to the trouble of keeping.
+            out.append(f"  ✗ {e['label']} failed: "
+                       f"{_head_tail(str(e.get('error') or ''), 200)}")
         elif ev == "permission_denied":
             out.append(f"  ⚠ {e['label']} was blocked from running commands "
                        f"({e.get('count')} denials) — its result is unverified")

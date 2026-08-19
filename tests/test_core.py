@@ -17,6 +17,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import threading
 import time
 import types
@@ -29,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "revi
 
 from review_loop import (  # noqa: E402
     GitError, STATE_DIRNAME, VALIDATION_FAILED, VALIDATION_NOT_CONFIGURED,
+    _git_capture,
     VALIDATION_PASSED,
     ADAPTERS, Ledger, Run, dedupe, extract_json, invoke_agent, normalise_findings,
     validate_config,
@@ -37,6 +40,7 @@ from review_loop import (  # noqa: E402
     _claude_argv, _codex_argv, _copilot_argv, _new_run_dir, _porcelain_entries,
     _extract_final_text, canonical_worktree_root, cmd_run, cmd_start, cmd_stop,
     cmd_detect, cmd_suggest, exit_code, _role_defaults,
+    rate_limit_message, rate_limit_delay, _wait_for_rate_limit, _clean_stderr,
     handoff_lock,
     resolve_config_repo, state_for_repo, worktree_fingerprint,
     _ensure_state_ignored,
@@ -751,6 +755,81 @@ class ProcessTreeTimeouts(unittest.TestCase):
         self.assertIn("partial-agent", (self.run_dir / "logs/timeout.log").read_text())
         self._assert_descendant_stopped(stopped_file)
 
+    def test_verbose_agent_is_not_killed_and_its_answer_survives(self):
+        """A thorough agent must not be destroyed for being verbose.
+
+        This is the regression that made long reviews and large
+        implementations fail: the loop terminated the agent the moment its
+        transcript crossed the log budget, then reported the corpse as an
+        agent failure.
+        """
+        chatty = self.tmp / "chatty.py"
+        chatty.write_text(
+            "import sys\n"
+            "sys.stdout.write('noise\\n' * 40000)\n"
+            "sys.stdout.write('FINAL ANSWER\\n')\n"
+        )
+        run = Run(self.tmp, self.run_dir,
+                  {"permission_mode": "acceptEdits", "max_log_chars": 1000})
+        adapter = dict(ADAPTERS["claude"])
+        adapter.update({
+            "bin": Path(sys.executable).name,
+            "argv": lambda *_args: ([sys.executable, str(chatty)], None),
+            "reads_out_file": False,
+            "config_dir_env": None,
+        })
+        with patch.dict(ADAPTERS, {"claude": adapter}):
+            ok, message = invoke_agent(
+                run, {"cli": "claude"}, "prompt", False, "Agent", "chatty")
+        self.assertTrue(ok, f"verbose agent was treated as a failure: {message}")
+        self.assertIn("FINAL ANSWER", message)
+        log = (self.run_dir / "logs/chatty.log").read_text()
+        self.assertLess(len(log), 20000, "log retention budget was not applied")
+        self.assertIn("elided", log)
+
+    def test_agent_error_keeps_the_tail_where_the_real_cause_lives(self):
+        """CLIs print a banner first and the actual reason last.
+
+        Head-only truncation discarded the reason and left only the banner,
+        which is how a run's true cause of death became undiagnosable.
+        """
+        failing = self.tmp / "banner_then_reason.py"
+        failing.write_text(
+            "import sys\n"
+            "sys.stderr.write('BANNER ' * 200)\n"
+            "sys.stderr.write('THE REAL REASON\\n')\n"
+            "sys.exit(1)\n"
+        )
+        run = Run(self.tmp, self.run_dir,
+                  {"permission_mode": "acceptEdits", "max_log_chars": 100000})
+        adapter = dict(ADAPTERS["claude"])
+        adapter.update({
+            "bin": Path(sys.executable).name,
+            "argv": lambda *_args: ([sys.executable, str(failing)], None),
+            "reads_out_file": False,
+            "config_dir_env": None,
+        })
+        with patch.dict(ADAPTERS, {"claude": adapter}):
+            ok, message = invoke_agent(
+                run, {"cli": "claude"}, "prompt", False, "Agent", "reason")
+        self.assertFalse(ok)
+        self.assertIn("THE REAL REASON", message)
+        events = [json.loads(line) for line
+                  in (self.run_dir / "progress.jsonl").read_text().splitlines()]
+        errors = [e for e in events if e.get("event") == "agent_error"]
+        self.assertTrue(errors)
+        self.assertIn("THE REAL REASON", errors[0]["error"])
+
+    def test_git_capture_still_fails_closed_when_output_overflows(self):
+        """Agents may be verbose; repository state may not be partial.
+
+        Everything downstream of a git read — the diff, the untracked listing,
+        the fingerprint — assumes it saw everything git had to say.
+        """
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, check=True)
+        with self.assertRaises(GitError):
+            _git_capture(self.tmp, "help", "-a", limit=64)
+
     def test_ignore_term_descendant_with_closed_pipes_is_still_killed(self):
         heartbeat = self.tmp / "heartbeat"
         pid_file = self.tmp / "ignored.pid"
@@ -881,15 +960,26 @@ class ProcessTreeTimeouts(unittest.TestCase):
         self.assertIn("good", results[0]["output_tail"])
         self.assertIn("tail", results[0]["output_tail"])
 
+        # A command that passes but prints a lot is a passing command. The log
+        # is capped; the verdict comes from the exit status.
         noisy = self.tmp / "noisy.py"
         noisy.write_text("print('x' * 100000)\n")
         status, results = run_validation(Run(
             self.tmp, self.run_dir,
             {"validation": {"commands": [f"{sys.executable} {noisy}"]},
              "max_log_chars": 1000}))
-        self.assertEqual(status, VALIDATION_FAILED)
+        self.assertEqual(status, VALIDATION_PASSED)
         self.assertLess(len(results[0]["output_tail"]), 5000)
-        self.assertIn("safety limit", results[0]["output_tail"])
+        self.assertIn("elided", results[0]["output_tail"])
+
+        # ...and a verbose command that genuinely fails still fails.
+        loud_failure = self.tmp / "loud_failure.py"
+        loud_failure.write_text("import sys; print('x' * 100000); sys.exit(3)\n")
+        status, results = run_validation(Run(
+            self.tmp, self.run_dir,
+            {"validation": {"commands": [f"{sys.executable} {loud_failure}"]},
+             "max_log_chars": 1000}))
+        self.assertEqual(status, VALIDATION_FAILED)
 
 
 class LedgerHistory(unittest.TestCase):
@@ -1043,7 +1133,9 @@ class ReadOnlyEnforcement(unittest.TestCase):
 
 class RoleSpecificDefaults(unittest.TestCase):
     def test_claude_uses_opus_high_for_builder_and_low_for_review(self):
-        self.assertEqual(_role_defaults("claude", False), ("opus", "high"))
+        # The panel gets the strong model; the builder gets a cheaper one.
+        # The builder dominates spend, and the panel is the product.
+        self.assertEqual(_role_defaults("claude", False), ("sonnet", "high"))
         self.assertEqual(_role_defaults("claude", True), ("opus", "low"))
 
     def test_codex_uses_sol_medium_for_builder_and_luna_xhigh_for_review(self):
@@ -1078,7 +1170,7 @@ class RoleSpecificDefaults(unittest.TestCase):
         agents = json.loads(output.getvalue())["agents"]
         claude = agents["claude"]
         self.assertEqual(claude["implementer_default"],
-                         {"model": "opus", "effort": "high"})
+                         {"model": "sonnet", "effort": "high"})
         self.assertEqual(claude["reviewer_default"],
                          {"model": "opus", "effort": "low"})
         codex = agents["codex"]
@@ -1684,3 +1776,101 @@ class ReviewShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RateLimitDetection(unittest.TestCase):
+    """Out of quota is a different fact from "the agent failed"."""
+
+    LIMIT = "You've hit your session limit \u00b7 resets 1:20pm (Europe/London)"
+
+    def envelope(self, **over):
+        base = {"is_error": True, "api_error_status": 429,
+                "terminal_reason": "api_error", "result": self.LIMIT}
+        base.update(over)
+        return json.dumps(base)
+
+    def test_claude_429_envelope_is_detected(self):
+        self.assertEqual(rate_limit_message("claude", self.envelope()), self.LIMIT)
+
+    def test_claude_error_without_429_still_matches_on_wording(self):
+        text = rate_limit_message("claude", self.envelope(api_error_status=None))
+        self.assertEqual(text, self.LIMIT)
+
+    def test_healthy_envelope_is_never_rate_limited(self):
+        """429 appears in byte counts and token totals; it is not a signal."""
+        healthy = json.dumps({
+            "is_error": False, "result": "done",
+            "usage": {"input_tokens": 429, "cache_read_input_tokens": 4291980},
+        })
+        self.assertIsNone(rate_limit_message("claude", healthy))
+
+    def test_ordinary_agent_failure_is_not_rate_limited(self):
+        self.assertIsNone(rate_limit_message("codex", "error: file not found (429 bytes)"))
+        self.assertIsNone(rate_limit_message("claude", self.envelope(
+            is_error=True, api_error_status=500, result="internal error")))
+
+    def test_text_based_clis_match_on_phrases(self):
+        self.assertIn("rate limit", rate_limit_message(
+            "codex", "stream error: rate limit reached; retry after 60s") or "")
+        self.assertIn("usage limit", rate_limit_message(
+            "copilot", "", "you have reached your usage limit") or "")
+
+    def test_reset_clock_becomes_a_delay(self):
+        now = datetime(2026, 8, 16, 10, 43, tzinfo=ZoneInfo("Europe/London"))
+        self.assertEqual(rate_limit_delay(self.LIMIT, now), 157 * 60)
+
+    def test_reset_clock_rolls_over_midnight(self):
+        now = datetime(2026, 8, 16, 23, 30, tzinfo=ZoneInfo("Europe/London"))
+        self.assertEqual(rate_limit_delay("resets 1:00am (Europe/London)", now), 90 * 60)
+
+    def test_unreadable_reset_yields_no_delay(self):
+        self.assertIsNone(rate_limit_delay("you are rate limited"))
+        self.assertIsNone(rate_limit_delay("resets 99:99pm"))
+
+    def _run(self, **config):
+        tmp = Path(tempfile.mkdtemp())
+        run_dir = tmp / "run"
+        run_dir.mkdir()
+        run = Run(tmp, run_dir, config)
+        run.rate_limited = self.LIMIT
+        return run
+
+    def test_waiting_is_off_by_default(self):
+        """A run must not silently sleep for hours nobody asked for."""
+        self.assertFalse(_wait_for_rate_limit(self._run(), "Reviewer"))
+
+    def test_wait_is_declined_when_the_reset_exceeds_the_budget(self):
+        run = self._run(rate_limit_wait_seconds=60)
+        self.assertFalse(_wait_for_rate_limit(run, "Reviewer"))
+        events = [json.loads(l) for l in run.progress.read_text().splitlines()]
+        self.assertTrue(any("exceeds" in str(e.get("message", "")) for e in events))
+
+
+class CodexStderrNoise(unittest.TestCase):
+    """Codex prints a banner before every run; the reason comes after it."""
+
+    BANNER = (
+        "2026-08-19T19:53:31.010684Z ERROR codex_models_manager::cache: failed to "
+        "load models cache: missing field `base_instructions` at line 95 column 5\n"
+        "2026-08-19T19:53:32.019780Z  WARN codex_core_skills::loader: ignoring "
+        "interface.icon_small: icon path with '..' must resolve under plugin assets/\n"
+        "OpenAI Codex v0.144.5\n"
+        "--------\n"
+        "workdir: /repo\nmodel: gpt-5.6-sol\nprovider: openai\n"
+        "approval: never\nsandbox: workspace-write"
+    )
+
+    def test_banner_is_dropped_so_the_reason_leads(self):
+        cleaned = _clean_stderr("codex", self.BANNER + "\nError: authentication failed")
+        self.assertEqual(cleaned, "Error: authentication failed")
+
+    def test_a_banner_only_failure_still_reports_something(self):
+        """Never turn a diagnosable failure into a silent one."""
+        self.assertIn("models cache", _clean_stderr("codex", self.BANNER))
+
+    def test_other_clis_are_untouched(self):
+        self.assertEqual(_clean_stderr("claude", self.BANNER), self.BANNER)
+        self.assertEqual(_clean_stderr("copilot", "model: x"), "model: x")
+
+    def test_empty_input_is_safe(self):
+        self.assertEqual(_clean_stderr("codex", ""), "")

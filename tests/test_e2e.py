@@ -43,10 +43,15 @@ else:
 pairs = list(zip(args, args[1:]))
 readonly = ("plan" in args or "read-only" in args
             or ("--deny-tool", "write") in pairs)
+import time as _time
+_started = _time.time()
+if readonly and os.environ.get("FAKE_REVIEWER_DWELL"):
+    _time.sleep(float(os.environ["FAKE_REVIEWER_DWELL"]))
 log = Path(os.environ["FAKE_CLI_LOG"])
 with log.open("a") as fh:
     fh.write(json.dumps({"cli": name, "args": args, "readonly": readonly,
                          "cwd": str(Path.cwd()),
+                         "started": _started, "ended": _time.time(),
                          "copilot_allow_all": os.environ.get("COPILOT_ALLOW_ALL")}) + "\n")
 
 scenario = os.environ.get("FAKE_SCENARIO", "clean")
@@ -77,19 +82,33 @@ else:
         release = Path(os.environ["FAKE_RELEASE"])
         while not release.exists():
             time.sleep(0.02)
-    if scenario == "validation_repair" and count == 1:
+    if scenario == "noop_implementer":
+        pass
+    elif scenario == "validation_repair" and count == 1:
         target.write_text("broken\n")
     elif scenario == "reviewer_repair" and count > 1:
         target.write_text("reviewer-fixed\n")
     else:
         target.write_text("fixed-by-agent\n")
     answer = "implemented"
-    failed = False
+    failed = scenario == "failed_implementer"
+
+if scenario == "rate_limited" and name == "claude":
+    print(json.dumps({
+        "is_error": True, "api_error_status": 429, "subtype": "success",
+        "terminal_reason": "api_error", "total_cost_usd": 1.51,
+        "usage": {"input_tokens": 26, "output_tokens": 5674,
+                  "cache_read_input_tokens": 892031},
+        "result": "You've hit your session limit \u00b7 resets 1:20pm (Europe/London)",
+    }))
+    sys.exit(1)
 
 if name == "codex":
     if "-o" in args:
         Path(args[args.index("-o") + 1]).write_text(answer)
     print("fake codex transcript")
+    print("tokens used")
+    print("12,345")
 elif name == "claude":
     print(json.dumps({"result": answer, "permission_denials": []}))
 else:
@@ -205,6 +224,220 @@ class FakeCliEndToEnd(unittest.TestCase):
         self.assertEqual(self.events()[-1]["outcome"], "approved")
         self.assertIn("Outcome: approved", (self.current_run() / "final.md").read_text())
         self.assertEqual((self.repo / "app.txt").read_text(), "fixed-by-agent\n")
+
+    def _peak_reviewer_concurrency(self):
+        windows = [(e["started"], e["ended"]) for e in
+                   (json.loads(l) for l in self.log.read_text().splitlines())
+                   if e.get("readonly")]
+        edges = [(s, 1) for s, _ in windows] + [(e, -1) for _, e in windows]
+        peak = live = 0
+        for _, delta in sorted(edges):
+            live += delta
+            peak = max(peak, live)
+        return peak, len(windows)
+
+    def test_reviewer_concurrency_is_capped_below_the_panel_size(self):
+        """Reviewers bill one account and all start at once, right after the
+        build agent's longest session — the worst moment to burst."""
+        reviewers = [{"persona": p, "cli": "claude", "model": "fake", "effort": "high"}
+                     for p in ("security", "performance", "test-engineer", "observability")]
+        result = self.run_loop(self.config(reviewers=reviewers),
+                               FAKE_REVIEWER_DWELL="0.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        peak, ran = self._peak_reviewer_concurrency()
+        self.assertEqual(ran, 4, "every reviewer should still run")
+        self.assertLessEqual(peak, 2, f"peak concurrency was {peak}")
+
+    def test_reviewer_concurrency_is_configurable(self):
+        reviewers = [{"persona": p, "cli": "claude", "model": "fake", "effort": "high"}
+                     for p in ("security", "performance", "test-engineer", "observability")]
+        result = self.run_loop(
+            self.config(reviewers=reviewers, max_parallel_reviewers=1),
+            FAKE_REVIEWER_DWELL="0.3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        peak, ran = self._peak_reviewer_concurrency()
+        self.assertEqual(ran, 4)
+        self.assertEqual(peak, 1)
+
+    def test_reviewer_prompt_bounds_repository_exploration(self):
+        self.run_loop(self.config(reviewer_read_budget=7))
+        prompt = next((self.current_run() / "work").glob("iter01-*.prompt.md")).read_text()
+        self.assertIn("Read what you need to judge this diff and stop there", prompt)
+        self.assertIn("roughly 7 files", prompt)
+
+    def test_large_diff_is_reported_with_the_panel_multiplier(self):
+        (self.repo / "big.txt").write_text("a line of plausible source\n" * 400)
+        self.git("add", "-A")
+        self.git("commit", "-m", "bulk")
+        result = self.run_loop(self.config(
+            large_diff_warning_tokens=100,
+            base_ref="HEAD~1", review_only=True,
+            reviewers=[{"persona": "security", "cli": "claude"},
+                       {"persona": "performance", "cli": "claude"}]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        warn = [e for e in self.events() if e["event"] == "large_diff"]
+        self.assertTrue(warn)
+        self.assertEqual(warn[0]["projected_tokens_per_round"],
+                         warn[0]["approx_tokens"] * 2)
+
+    def test_failed_implementer_reports_the_baseline_that_actually_ran(self):
+        """final.md claimed nothing was verified while four gates had passed."""
+        result = self.run_loop(self.config(), "failed_implementer")
+        self.assertNotEqual(result.returncode, 0)
+        final = (self.current_run() / "final.md").read_text()
+        self.assertIn("Outcome: implementer_failed", final)
+        self.assertNotIn("NOT CONFIGURED", final)
+        self.assertEqual(self.events()[-1]["validation_status"], "passed")
+
+    def test_stopping_mid_build_is_not_reported_as_a_build_failure(self):
+        """`stop --kill` terminates the agent; that is a stop, not a defect."""
+        started = self.run_loop(self.config(), "hold", command="start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        run_dir = Path(json.loads(started.stdout)["run_dir"])
+        deadline = time.time() + 5
+        while not self.count.exists() and time.time() < deadline:
+            time.sleep(0.02)
+
+        subprocess.run([sys.executable, str(SCRIPT), "stop", "--kill",
+                        "--run", str(run_dir)],
+                       cwd=self.repo, env=self.env("hold"), text=True,
+                       capture_output=True, timeout=20)
+        (self.root / "release-agent").write_text("go")
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            events = self.events(run_dir) if (run_dir / "progress.jsonl").exists() else []
+            if events and events[-1].get("event") == "run_complete":
+                break
+            time.sleep(0.05)
+        outcome = self.events(run_dir)[-1]["outcome"]
+        self.assertEqual(outcome, "stopped_by_user")
+        final = (run_dir / "final.md").read_text()
+        self.assertIn("Outcome: stopped_by_user", final)
+        self.assertNotIn("Outcome: implementer_failed", final)
+
+    def test_provider_limit_ends_the_run_instead_of_spending_more(self):
+        """Out of quota is not "the agent failed", and not a quiet panel.
+
+        The reviewers that never answered did not review and approve — they
+        never ran. Continuing means the rest of the panel and the next round
+        hit the same wall.
+        """
+        result = self.run_loop(self.config(), "rate_limited")
+        self.assertNotEqual(result.returncode, 0)
+        events = self.events()
+        self.assertEqual(events[-1]["outcome"], "rate_limited")
+        limited = [e for e in events if e["event"] == "rate_limited"]
+        self.assertTrue(limited)
+        self.assertIn("session limit", limited[0]["detail"])
+        self.assertIsInstance(limited[0]["resets_in_seconds"], int)
+        # What the dead attempt cost is still recorded.
+        self.assertEqual(limited[0]["cost_usd"], 1.51)
+        # It must not be retried instantly against the wall, nor misreported.
+        self.assertEqual([e for e in events if e["event"] == "agent_retry"], [])
+        self.assertEqual([e for e in events if e["event"] == "agent_error"], [])
+        final = (self.current_run() / "final.md").read_text()
+        self.assertIn("Outcome: rate_limited", final)
+        self.assertNotIn("Outcome: approved", final)
+
+    def test_rate_limited_run_renders_the_reset_time(self):
+        self.run_loop(self.config(), "rate_limited")
+        render = subprocess.run(
+            [sys.executable, str(SCRIPT), "render", "--repo", str(self.repo)],
+            cwd=self.repo, env=self.env(), text=True, capture_output=True, timeout=20)
+        self.assertIn("cut off by a provider limit", render.stdout)
+        self.assertIn("session limit", render.stdout)
+
+    def test_empty_diff_is_never_an_approval(self):
+        """A panel handed nothing approves in seconds, and that is not a review.
+
+        This is the shape that produced a green `approved` over a change
+        nobody made: the work was already committed, so the base was HEAD and
+        the diff was empty.
+        """
+        result = self.run_loop(self.config(), "noop_implementer")
+        self.assertNotEqual(result.returncode, 0)
+        last = self.events()[-1]
+        self.assertEqual(last["outcome"], "empty_diff")
+        final = (self.current_run() / "final.md").read_text()
+        self.assertIn("Outcome: empty_diff", final)
+        self.assertNotIn("Outcome: approved", final)
+        # No reviewer should have been paid for reviewing nothing.
+        self.assertEqual([e for e in self.events() if e["event"] == "review_done"], [])
+
+    def test_base_ref_reviews_already_committed_work(self):
+        """Reviewing a finished branch must not require faking a dirty tree."""
+        start = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "shipped.txt").write_text("already committed work\n")
+        self.git("add", "-A")
+        self.git("commit", "-m", "work under review")
+
+        result = self.run_loop(
+            self.config(base_ref=start), "noop_implementer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events()
+        self.assertEqual(events[-1]["outcome"], "approved")
+        self.assertEqual(events[0]["base_sha"], start)
+        diff_ready = [e for e in events if e["event"] == "diff_ready"][0]
+        self.assertGreater(diff_ready["chars"], 0)
+        prompts = list((self.current_run() / "work").glob("iter01-*.prompt.md"))
+        self.assertTrue(prompts)
+        self.assertIn("already committed work", prompts[0].read_text())
+
+    def test_base_ref_must_resolve_and_be_behind_head(self):
+        unrelated = self.run_loop(self.config(base_ref="no-such-ref"))
+        self.assertNotEqual(unrelated.returncode, 0)
+        self.assertIn("base_ref", unrelated.stdout + unrelated.stderr)
+
+        bad = self.run_loop(self.config(base_ref="--upload-pack=evil"))
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("base_ref", bad.stdout + bad.stderr)
+
+    def test_review_only_skips_the_build_pass_entirely(self):
+        """The panel is useful long after the build agent has finished."""
+        start = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "shipped.txt").write_text("finished work\n")
+        self.git("add", "-A")
+        self.git("commit", "-m", "work under review")
+
+        result = self.run_loop(self.config(base_ref=start, review_only=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events()
+        self.assertEqual(events[-1]["outcome"], "approved")
+        self.assertTrue(any(e["event"] == "implementer_skipped" for e in events))
+        # The build agent was never invoked, so it cannot have touched the branch.
+        self.assertFalse(self.count.exists())
+        self.assertEqual((self.repo / "app.txt").read_text(), "fixed\n")
+        self.assertTrue(any(e["event"] == "review_done" for e in events))
+
+    def test_review_only_requires_something_to_review(self):
+        result = self.run_loop(self.config(review_only=True))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review_only", result.stdout + result.stderr)
+
+    def test_min_iterations_runs_a_second_panel_over_clean_code(self):
+        """`max_iterations` is a cap; asking for two panels must give two."""
+        result = self.run_loop(self.config(min_iterations=2, max_iterations=3))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events()
+        self.assertEqual(events[-1]["outcome"], "approved")
+        self.assertEqual(events[-1]["rounds"], 2)
+        rounds = [e for e in events if e["event"] == "round_summary"]
+        self.assertEqual(len(rounds), 2)
+        # The second panel reviewed the same code without being called
+        # no-progress, and no fix round ran because there was nothing to fix.
+        self.assertEqual(self.count.read_text(), "1")
+
+    def test_codex_token_usage_is_recorded(self):
+        result = self.run_loop(self.config(cli="codex"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        done = [e for e in self.events() if e["event"] == "agent_done"]
+        self.assertTrue(done)
+        self.assertTrue(all(e.get("tok_total") == 12345 for e in done), done)
+        render = subprocess.run(
+            [sys.executable, str(SCRIPT), "render", "--repo", str(self.repo)],
+            cwd=self.repo, env=self.env(), text=True, capture_output=True, timeout=20)
+        self.assertIn("total", render.stdout)
 
     def test_validation_failure_is_sent_back_for_repair(self):
         result = self.run_loop(self.config(), "validation_repair")
