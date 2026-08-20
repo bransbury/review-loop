@@ -1,6 +1,6 @@
 ---
 name: review-loop
-version: 0.4.0
+version: 0.5.0
 description: "Implement a task with a build agent, then have a configurable panel of adversarial reviewer personas review it in parallel, fix the findings, and re-review from scratch until tests pass and no blocking findings remain."
 ---
 
