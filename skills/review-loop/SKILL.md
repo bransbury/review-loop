@@ -30,8 +30,10 @@ You are the wizard and the renderer. The script is the orchestrator. Do not reim
 - **Every review round starts from scratch.** Never ask "did the implementer fix ARCH-001?". Anchoring on prior findings hides regressions introduced by the fixes.
 - **Tests are an independent gate.** Agreement between models is not a definition of correctness. If validation fails, the loop keeps going even when every reviewer approves.
 - **A missing answer is never a clean one.** A review counts only if it parses *and* is structurally a review — explicit verdict, `findings` list, objects inside it. If any reviewer fails that, the round is incomplete and the run cannot be approved, no matter how quiet the rest of the panel was.
+- **An empty diff is not a clean review.** If there is nothing to review, the panel will approve in seconds and mean nothing by it. The run ends as `empty_diff`. When the work is already committed, set `base_ref` to the commit it started from — do not reach for `allow_dirty` to manufacture a diff.
 - **A gate that never ran did not pass.** A run with no validation commands is rejected at launch; approving without one takes an explicit `allow_missing_validation`, and reports as `approved_unverified`.
 - **A failing baseline stops by default.** Do not silently expand the task to pre-existing failures. Only set `require_clean_baseline: false` when the user confirms that repairing the baseline is part of the task.
+- **A provider limit is not a review.** When an agent is cut off because the account ran out of quota, the run ends as `rate_limited`. A reviewer that never ran did not examine the code and find nothing. Never describe such a round as clean, and do not immediately re-run: the next round hits the same wall.
 - **One harness by default.** Every slot uses the CLI you were invoked from unless the user explicitly opts into mixing.
 - **Never run this on a dirty working tree** without telling the user. Uncommitted work will be mixed into the diff under review and may be modified by the implementer. The script refuses to start on a dirty or non-git tree unless the config says `allow_dirty` / `allow_non_git`, and it holds a lock so only one run at a time can touch a worktree.
 
@@ -42,9 +44,14 @@ Be concise. Do not paste the diff, the prompts, or the raw JSON into the convers
 The orchestrator is where the real spend happens, and a panel multiplies it — the diff goes to every reviewer, every round. So:
 
 - **Recommend the smallest panel that covers the task.** Two or three reviewers. Every extra reviewer is a whole extra agent invocation per round, and per-invocation overhead dominates the diff itself.
+- **Reviewers are the panel, the build agent is the bill.** Measured runs put the builder at half to over nine tenths of total spend, because it runs the longest session and repeats it every fix round. Reach for a smaller task before a smaller panel.
+- **Reviewers explore the repository, and that costs more than the diff.** A reviewer typically reads many times the diff's worth of surrounding code. `reviewer_read_budget` (default 25 files) is the lever; lower it for a narrow change, raise it when a reviewer genuinely needs to trace a wide call graph.
+- **Do not raise `max_parallel_reviewers`** just to finish sooner. Reviewers all bill one account unless spread across `config_dir`s, and they start together right after the build agent's heaviest session. Wall-clock is the cheap resource in a detached run.
 - **Do not raise `max_iterations` above 5** unless asked. Rounds are the most expensive unit in the system.
 - **Do not disable `exclude_noise`** unless the user is specifically reviewing a lockfile or generated output.
 - **Never re-read files to summarise them yourself.** The reviewers already have the diff; reading it again into your own context buys nothing.
+
+`render` prints a `spend:` line whenever the CLI reports usage — Claude gives a full breakdown with cost, Codex a single token total per invocation. Quote it when reporting a finished run: the cost of a panel is otherwise invisible until the bill arrives. Copilot reports nothing, because the adapter invokes it with `--silent`; say so plainly rather than implying a Copilot run was cheap.
 
 ## 1. Preflight
 
@@ -64,13 +71,17 @@ Then check the repository state. The script enforces all of this itself and will
 
 If no task was supplied with the invocation, ask for one before anything else.
 
+**Then check the task is one PR, not three.** Cost scales with scope worse than linearly: a bigger task means a longer build session, a bigger diff paid for by every reviewer on every round, and more rounds to converge. If the task spans several independent concerns — a migration *and* an API change *and* a UI surface — say so and offer to split it with the `shape` skill, then run the loop per piece. Splitting is cheaper than a wide panel, and the findings are better because each panel sees a diff it can hold at once. The loop also emits a `large_diff` event once the payload passes the warning threshold; pass that on when it appears, because by then the only remaining lever is the next run.
+
 ## 2. Configure
 
 Ask these questions using your host's interactive question mechanism. In Claude Code that is `AskUserQuestion`; in Copilot CLI it is the `ask_user` tool; elsewhere ask in plain text with numbered options. Group them so the user answers in as few steps as possible.
 
 Load `~/.review-loop/defaults.json` if it exists and use it to pre-fill every answer. Offer to save the answers back there at the end of a successful configuration.
 
-**Question 1 — Build agent.** Which model and effort implements the task. In Claude Code, default to the strongest model the invoking CLI offers at `high`. In non-Claude hosts (Codex, Cursor, VS Code/Copilot, and similar), default to GPT-5.6 Sol at `medium` when `detect` reports it; otherwise use the detected harness fallback. This role-specific default keeps the strongest model in the coordinating, iterative builder role without overspending on each pass.
+**Question 1 — Build agent.** Which model and effort implements the task. In Claude Code, default to Sonnet at `high`. In non-Claude hosts (Codex, Cursor, VS Code/Copilot, and similar), default to GPT-5.6 Sol at `medium` when `detect` reports it; otherwise use the detected harness fallback.
+
+The builder is the single most expensive role in the system, by a wide margin. It runs the longest agentic session, and it runs again on every fix round; measured runs have put it at half to over nine tenths of total spend. The panel is what makes the loop worth running, so the strong model goes there. Offer the strongest builder explicitly for tasks that warrant it — a large refactor, an unfamiliar codebase, anything where a weak first draft would just generate findings — and say that is what you are doing. Never quietly upgrade it.
 
 **Question 2 — Reviewers.** Do not make the user choose blind. Run:
 
@@ -84,7 +95,7 @@ Two or three reviewers is the useful range. More than four mostly produces dupli
 
 The same persona may appear twice on different models — that is a legitimate way to get two independent opinions from one lens, and the orchestrator gives each slot its own identity so they can corroborate each other.
 
-**Question 3 — Model and effort per reviewer.** Let the user override each reviewer individually. In Claude Code, default every reviewer to the rolling Opus alias at `low`. In non-Claude hosts, default every reviewer to GPT-5.6 Luna at `xhigh` when `detect` reports it; otherwise use that harness's detected reviewer fallback.
+**Question 3 — Model and effort per reviewer.** Let the user override each reviewer individually. In Claude Code, default every reviewer to the rolling Opus alias at `low` — the strong model belongs on the panel. In non-Claude hosts, default every reviewer to GPT-5.6 Luna at `xhigh` when `detect` reports it; otherwise use that harness's detected reviewer fallback.
 
 **Question 4 — Mixing (only if `detect` found more than one CLI).** Default is no. If the user opts in, re-ask question 3 with models from every detected CLI, labelled by which one they come from. Cross-family reviewers disagree more usefully than same-family ones, which is the main reason to bother.
 
@@ -139,6 +150,37 @@ Safety escape hatches are off by default. Clean-baseline enforcement is on by de
 | `require_clean_baseline: false` | Continue after a failing baseline only when repairing it is explicitly within task scope. |
 | `max_untracked_files` | How many new files are inlined into the diff (default 60). The rest are listed by path so reviewers know to read them. |
 
+Two further keys shape *what* gets reviewed and *how many times*. Neither is a safety override:
+
+| Key | Effect |
+|---|---|
+| `base_ref` | The commit to diff from. Defaults to HEAD at launch, which is right when the build agent is about to make the changes. Set it to review work that is **already committed** — `"base_ref": "004de6f0"` reviews everything since that commit. It must resolve to a commit and be an ancestor of HEAD; the run refuses to start otherwise. |
+| `min_iterations` | Review rounds to run even when a round comes back clean (default 1). `max_iterations` is a cap, not a target: without this, a clean first round ends the run. Set it to 2 when you want a second independent panel over the same code. Rounds are the most expensive unit in the system — raise it deliberately. |
+| `large_diff_warning_tokens` | When a round's diff exceeds this many approximate tokens, the loop emits a `large_diff` event with the panel multiplication already done (default 25,000). It does not change behaviour — it is there so the cost of an oversized task is visible while there is still a decision to make. |
+| `rate_limit_wait_seconds` | How long the loop may sleep waiting for a provider quota to reset (default 0, meaning do not wait). When the limit message names a reset time the loop waits for it, otherwise it backs off within this budget, and it retries the cut-off agent once. Useful for a detached overnight run; leave it at 0 when you want to know immediately. |
+| `review_only` | Skip the initial implementation pass and go straight to review. Use it to audit work that is already written; pointing a build agent at a finished branch invites it to re-implement what is already there. The implementer still runs for fix rounds, once a reviewer raises something concrete. Requires `base_ref` or `allow_dirty` — something has to be in the diff. |
+
+### Reviewing work that is already finished
+
+This is a first-class use of the loop, not a workaround. To audit commits `004de6f0..f36c92f3`:
+
+```json
+{
+  "base_ref": "004de6f0",
+  "review_only": true,
+  "min_iterations": 2
+}
+```
+
+`base_ref` is the commit **before** the work, and it is excluded from the diff — the same meaning as `git diff <base>..HEAD`. When someone describes the work as "commits A..B", confirm which they mean before launching:
+
+- `"base_ref": "A"` reviews everything *after* A.
+- `"base_ref": "A~1"` reviews everything *including* A.
+
+The two can differ by a great deal. Check with `git diff --stat <base>..HEAD` and say which you used.
+
+Do not instead write a task prompt that asks the build agent to do nothing, and do not set `allow_dirty` to manufacture a diff out of committed work. Both leave the run one mistake away from reviewing an empty diff.
+
 Before the build agent runs, the loop records a **baseline** validation result in `validation-00.json`. A failure ends as `baseline_failed` before the agent runs. With the explicit repair-task override, the failure is instead reported to the implementer, reviewers, and `final.md`.
 
 Each reviewer slot accepts an optional `config_dir`, which sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that agent. Use it only if the user has a second authenticated account and asks for it — it spreads rate limits across subscriptions. It is off by default.
@@ -176,6 +218,7 @@ Between polls, tell the user they can keep working and that `status` and `stop` 
 Two events need surfacing immediately rather than at the end:
 
 - **`permission_denied`** — the build agent was blocked from running commands, so its "success" is unverified. Tell the user at once and offer to stop and restart with full permissions.
+- **`rate_limited`** — the account ran out of quota mid-run. The event carries the provider's message and, where it can be read, the seconds until reset. Say so at once, with the reset time; the run is over and anything already spent on that round bought nothing.
 - **`review_unparsed`** — a reviewer contributed nothing usable: it failed, returned output that would not parse or that was not a well-formed review (no verdict, a `findings` value that is not a list of objects), or requested changes without naming a single finding. The `reason` field says which. Its findings are missing from the round, so the panel is smaller than the user thinks. Say so rather than reporting a clean review. The loop will not approve a round in this state; it ends as `review_incomplete`.
 
 ## 5. Finish
@@ -197,11 +240,14 @@ Outcomes and what to do about them:
 | `approved` | 0 | Every reviewer reported, nothing blocking is open, validation passed. |
 | `approved_unverified` | 0 | Same, but no validation commands existed. Model consensus only — say so. |
 | `review_incomplete` | 2 | A reviewer contributed nothing. Part of the change went unreviewed. Not an approval. |
+| `rate_limited` | 2 | The account hit its usage or session limit mid-run. Not an approval, and not an agent failure. Wait for the reset, or set `rate_limit_wait_seconds`. |
+| `empty_diff` | 2 | There was nothing to review. Either the build agent changed nothing, or `base_ref` needs to name the commit the work started from. Never an approval. |
 | `validation_not_configured` | 2 | Nothing blocking is open, but there was no gate and no explicit opt-in. |
 | `baseline_failed` | 1 | Validation was failing before the task started; clean baseline is the default. |
 | `max_iterations_reached` | 2 | Hit the cap with blocking findings open. |
 | `no_progress` | 2 | A fix round changed nothing the reviewers cared about. |
 | `implementer_failed` | 1 | The build agent could not complete a round. |
+| `stopped_by_user` | 2 | Stopped on request, including by `stop --kill`. The working tree holds whatever the last completed step produced. Not a failure, and not a review. |
 | `run_failed` | 1 | A safety-critical Git operation or unexpected orchestration step failed; terminal state and report were still written. |
 
 **If the outcome is `max_iterations_reached`, `no_progress` or `review_incomplete`, say so plainly and stop.** The first two mean the panel and the implementer did not converge. `no_progress` specifically means a fix round changed nothing the reviewers cared about — re-running would cost another full panel to receive the same answer. `review_incomplete` means part of the change was never reviewed; offer to re-run that reviewer, and never describe the result as clean. Do not raise the cap or restart without being asked.
@@ -250,5 +296,7 @@ Stop and hand back to the user when:
 - the project has no validation commands and the user has not accepted an unverified run
 - the implementer fails twice in a row
 - a reviewer returns unparseable output twice for the same round — the run ends as `review_incomplete`, which is not an approval
+- the account hits a provider usage limit — report the reset time and stop; re-running before then buys nothing
+- the diff is empty, so no reviewer saw any code — check `base_ref` before re-running
 - the iteration cap is reached with blocking findings outstanding
 - validation was already failing before the loop started — stop on `baseline_failed`; only configure `require_clean_baseline: false` for a task whose stated purpose includes fixing it
