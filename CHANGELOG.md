@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-20
+
 ### Fixed
 
 - Stop terminating agents for being verbose. `max_log_chars` was passed to the
@@ -202,7 +204,8 @@ truth.
   iterative implementer handoffs.
 - Universal symlink-or-copy installer.
 
-[Unreleased]: https://github.com/bransbury/review-loop/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bransbury/review-loop/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bransbury/review-loop/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bransbury/review-loop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bransbury/review-loop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bransbury/review-loop/releases/tag/v0.2.0
